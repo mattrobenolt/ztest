@@ -69,6 +69,23 @@ test "panic via unreachable" {
     unreachable;
 }
 
+test "fuzz: simple corpus" {
+    // Verify that std.testing.fuzz works with ztest — it should just run
+    // the corpus inputs as normal test calls (non-fuzz mode).
+    try std.testing.fuzz(.{}, fuzzCallback, .{
+        .corpus = &.{
+            "hello",
+            "world",
+            "",
+        },
+    });
+}
+
+fn fuzzCallback(_: @TypeOf(.{}), input: []const u8) anyerror!void {
+    // Simple callback that just checks the input is valid.
+    _ = input;
+}
+
 // ── Internal helpers (copied from test_runner.zig for testing) ──────────────
 
 fn friendlyName(name: []const u8) []const u8 {

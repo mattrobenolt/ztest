@@ -118,8 +118,44 @@ printed to stderr.
 
 - `std.Progress` TUI (the whole point)
 - The stdin/stdout server protocol (by using `.mode = .simple`)
-- Fuzz testing support (this requires the server protocol; use the default
-  runner if you need fuzzing)
+- **Fuzz mode** (`zig build test --fuzz`) — this requires the server protocol
+  to communicate coverage data and receive fuzzing commands. ztest runs fuzz
+  tests in corpus-only mode (just runs the provided corpus inputs), which is
+  what you want for normal test runs. For actual fuzzing, use the default runner.
+
+## Fuzz testing
+
+ztest supports fuzz tests — `std.testing.fuzz()` works and runs the provided
+corpus inputs as normal test calls. This covers the common case: running tests
+in CI or with an agent, where you want the corpus validated but don't need
+actual fuzzing.
+
+For actual fuzzing (`zig build test --fuzz`), the build system needs the server
+protocol, which ztest's `.mode = .simple` bypasses. Use a conditional test runner
+in your `build.zig`:
+
+```zig
+const ztest = b.dependency("ztest", .{});
+
+// Use ztest for normal test runs, default runner for fuzzing.
+const fuzz_mode = b.option(bool, "fuzz", "Enable fuzzing") orelse false;
+
+const tests = b.addTest(.{
+    .root_module = my_module,
+    .test_runner = if (!fuzz_mode)
+        .{ .path = ztest.path("src/test_runner.zig"), .mode = .simple }
+    else
+        null, // use the built-in runner for fuzz mode
+});
+```
+
+Then:
+- `zig build test` — uses ztest (clean output, agent-friendly)
+- `zig build test --fuzz` — uses the default runner (fuzz mode)
+- `zig build test -Dfuzz` — uses the default runner (fuzz mode, if using the option above)
+
+**Note:** If you use `--fuzz` without the conditional, ztest will panic with a
+clear message explaining that fuzz mode requires the default runner.
 
 ## License
 

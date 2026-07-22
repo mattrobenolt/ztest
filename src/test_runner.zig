@@ -359,6 +359,51 @@ fn readEnvBoolDefault(allocator: std.mem.Allocator, key: []const u8, default: bo
     return readEnvBool(allocator, key) orelse default;
 }
 
+// ── Fuzz support ───────────────────────────────────────────────────────────
+//
+// std.testing.fuzz is an inline function that calls @import("root").fuzz(),
+// so the test runner (which is root in test mode) must export this function.
+//
+// When NOT in fuzz mode (normal `zig build test`), this just runs the provided
+// corpus inputs as regular test calls — no server protocol needed.
+//
+// When IN fuzz mode (`zig build test --fuzz`), this needs libfuzzer symbols
+// that are linked in a separate compilation unit. ztest does NOT support fuzz
+// mode — use the default test runner for fuzzing by conditionally setting
+// test_runner in build.zig only when not fuzzing.
+
+/// Fuzzer extern symbols. These are only linked when builtin.fuzz is true.
+/// We declare them here so the function compiles, but they're only called
+/// in the `builtin.fuzz` branch which is never reached in simple mode.
+extern fn fuzzer_init_corpus_elem(input_ptr: [*]const u8, input_len: usize) void;
+extern fn fuzzer_start(testOne: *const fn ([*]const u8, usize) callconv(.c) void) void;
+
+pub fn fuzz(
+    context: anytype,
+    comptime testOne: fn (context: @TypeOf(context), input: []const u8) anyerror!void,
+    options: testing.FuzzInputOptions,
+) anyerror!void {
+    @disableInstrumentation();
+
+    // When not in fuzz mode, just run the corpus as normal test calls.
+    // This is the path that matters for ztest — agents and CI run tests,
+    // they don't fuzz.
+    if (!builtin.fuzz) {
+        for (options.corpus) |input| {
+            try testOne(context, input);
+        }
+        // Smoke test with empty input if no corpus was provided.
+        try testOne(context, "");
+        return;
+    }
+
+    // Fuzz mode requires the server protocol and libfuzzer. ztest uses
+    // .mode = .simple which bypasses the server protocol, so fuzzing
+    // is not supported here. Users should conditionally use the default
+    // runner when fuzzing — see the README for the build.zig pattern.
+    @panic("ztest: fuzz mode is not supported with .mode = .simple. Use the default test runner for --fuzz.");
+}
+
 // ── Aliases ─────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
