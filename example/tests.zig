@@ -27,3 +27,7 @@ test "memory leak" {
     const allocator = std.testing.allocator;
     _ = try allocator.alloc(u8, 100);
 }
+
+test "panic demonstration" {
+    @panic("intentional panic");
+}

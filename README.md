@@ -102,6 +102,18 @@ on failure.
 - Proper exit codes (0 = all passed, 1 = any failure or leak)
 - Custom panic handler that identifies which test panicked
 
+## Panic handling
+
+ztest includes a custom panic handler that prevents a known issue in Zig
+0.15.x where `std.debug.dumpCurrentStackTrace` can loop forever at 100% CPU
+on certain platforms (notably aarch64-linux in VMs), making test panics appear
+as hangs. See [ziglang/zig#18286](https://github.com/ziglang/zig/issues/18286).
+
+Instead of calling `std.debug.defaultPanic` (which triggers the infinite loop),
+ztest walks the stack with a hard frame limit (64 frames) and exits
+immediately. The panic message, test name, and a bounded stack trace are still
+printed to stderr.
+
 ## What it drops
 
 - `std.Progress` TUI (the whole point)

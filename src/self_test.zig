@@ -57,6 +57,18 @@ test "memory leak detection" {
     _ = try allocator.alloc(u8, 64);
 }
 
+test "panic via @panic" {
+    @panic("intentional panic for testing");
+}
+
+test "panic via debug.assert" {
+    std.debug.assert(1 == 2);
+}
+
+test "panic via unreachable" {
+    unreachable;
+}
+
 // ── Internal helpers (copied from test_runner.zig for testing) ──────────────
 
 fn friendlyName(name: []const u8) []const u8 {

@@ -25,14 +25,70 @@ const builtin = @import("builtin");
 
 var current_test: ?[]const u8 = null;
 
+/// Maximum number of stack frames to attempt to resolve during a panic.
+/// This prevents infinite loops in StackIterator on platforms where the
+/// stack frame chain is circular (e.g. aarch64-linux in VMs).
+/// See https://github.com/ziglang/zig/issues/18286
+const max_panic_frames = 64;
+
 pub const panic = std.debug.FullPanic(struct {
     pub fn panicFn(msg: []const u8, first_trace_addr: ?usize) noreturn {
         if (current_test) |ct| {
-            std.debug.print("PANIC in test \"{s}\": {s}\n", .{ ct, msg });
+            print("PANIC in test \"{s}\": {s}\n", .{ ct, msg });
+        } else {
+            print("PANIC: {s}\n", .{msg});
         }
-        std.debug.defaultPanic(msg, first_trace_addr);
+
+        // Do NOT call std.debug.defaultPanic — it calls dumpCurrentStackTrace
+        // which uses StackIterator to walk live stack frames. On some platforms
+        // (aarch64-linux in VMs), StackIterator.next() never returns null,
+        // causing an infinite loop at 100% CPU.
+        // See https://github.com/ziglang/zig/issues/18286
+        //
+        // Instead, do a bounded stack walk that is guaranteed to terminate.
+        dumpBoundedStackTrace(first_trace_addr);
+        std.posix.exit(1);
     }
 }.panicFn);
+
+/// Walk the stack with a hard frame limit. Resolves source locations when
+/// debug info is available, but never loops more than `max_panic_frames` times.
+fn dumpBoundedStackTrace(start_addr: ?usize) void {
+    if (builtin.strip_debug_info) {
+        print("  (debug info stripped, no stack trace available)\n", .{});
+        return;
+    }
+
+    const debug_info = std.debug.getSelfDebugInfo() catch |err| {
+        print("  (unable to open debug info: {s})\n", .{@errorName(err)});
+        return;
+    };
+
+    var stderr_buf: [4096]u8 = undefined;
+    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+
+    var it = std.debug.StackIterator.init(start_addr, null);
+    defer it.deinit();
+
+    var frame: usize = 0;
+    while (frame < max_panic_frames) : (frame += 1) {
+        const return_address = it.next() orelse break;
+
+        // On arm64 macOS, the address of the last frame is 0x0 rather than
+        // 0x1 as on x86_64, so use saturating subtraction to avoid overflow.
+        const address = return_address -| 1;
+
+        // Try to resolve source location. If this fails, print the raw address.
+        std.debug.printSourceAtAddress(debug_info, &stderr_writer.interface, address, .no_color) catch {
+            print("  #{d}: 0x{x}\n", .{ frame, return_address });
+        };
+        stderr_writer.interface.flush() catch {};
+    }
+
+    if (frame == max_panic_frames) {
+        print("  ... (stopped after {d} frames to prevent infinite loop)\n", .{max_panic_frames});
+    }
+}
 
 pub fn main() !void {
     var mem: [4096]u8 = undefined;
