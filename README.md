@@ -1,6 +1,6 @@
 # ztest
 
-A custom test runner for [Zig](https://ziglang.org/) that produces clean, parseable output.
+A custom test runner for [Zig](https://ziglang.org/) that writes plain text to stderr instead of a TUI.
 
 ```
 ztest: Running 42 tests...
@@ -22,26 +22,15 @@ TESTS FAILED
 
 ## Why?
 
-Zig's built-in test runner uses a TUI progress display (`std.Progress`) that is
-hostile to non-interactive consumers — AI agents, CI pipelines, log collectors.
-When piped, it produces inconsistent output. When run through `zig build test`,
-it communicates with the build runner over stdin/stdout using a binary protocol,
-which means there's no readable test output and writing to stdout in tests
-[deadlocks](https://github.com/ziglang/zig/issues/15091).
+Zig's built-in test runner uses `std.Progress` for a TUI that doesn't make sense when piped. Under `zig build test`, the build runner and test binary talk over stdin/stdout with a binary protocol, so there's no readable output and writing to stdout in tests [deadlocks](https://github.com/ziglang/zig/issues/15091).
 
-`ztest` replaces the built-in runner with one that simply writes results to
-stderr as plain text. One line per test. Stack traces inline on failure. No TUI,
-no binary protocol, no deadlocks.
+ztest uses `.mode = .simple` to skip the protocol. Results go straight to stderr as plain text: one line per test, stack traces inline on failure.
 
 ## Usage
-
-Add ztest to your `build.zig.zon`:
 
 ```sh
 zig fetch --save https://github.com/mattrobenolt/ztest/archive/refs/tags/v0.1.0.tar.gz
 ```
-
-Then set it as your test runner in `build.zig`:
 
 ```zig
 const ztest = b.dependency("ztest", .{});
@@ -62,26 +51,19 @@ const test_step = b.step("test", "Run tests");
 test_step.dependOn(&run_tests.step);
 ```
 
-Or with `zig test` directly (no build system):
+Or with `zig test` directly:
 
 ```sh
 zig test --test-runner src/test_runner.zig foo.zig
 ```
 
-That's it. `zig build test` now uses ztest instead of the built-in runner.
+## Output
 
-## Behavior
+ztest checks whether stderr is a TTY and picks a format:
 
-ztest detects whether stderr is a TTY and adjusts output accordingly:
+**TTY:** colored dots (`.` pass, `F` fail, `S` skip, `L` leak). Set `ZTEST_VERBOSE=1` for one line per test with timing.
 
-**TTY (human at a terminal):** Colored dots by default — `.` for pass, `F` for
-fail, `S` for skip, `L` for leak. Use `ZTEST_VERBOSE=1` for one line per test
-with timing.
-
-**Non-TTY (agents, CI, piped):** One line per test, always. No ANSI codes.
-This is the format that matters for agents — each test is a single parseable
-line with its status, name, and error details. Stack traces are printed inline
-on failure.
+**Non-TTY:** one line per test, no ANSI codes. This is what agents and CI see. Each line has the status, test name, and error details. Stack traces print inline on failure. Timing is always shown.
 
 ## Environment variables
 
@@ -92,52 +74,32 @@ on failure.
 | `ZTEST_FAIL_FAST` | off | `1` = stop on first failure |
 | `ZTEST_FILTER` | none | Only run tests whose fully-qualified name contains the substring |
 
-## What it preserves
+## Features
+
+Same as the built-in runner:
 
 - Memory leak detection via `std.testing.allocator` (per-test reset and check)
 - `error.SkipZigTest` handling
 - Stack traces on failure (`@errorReturnTrace`)
-- `std.log` error level counting
-- `--seed=N` argument for `std.testing.random_seed`
-- Proper exit codes (0 = all passed, 1 = any failure or leak)
-- Custom panic handler that identifies which test panicked
+- `std.log` error level counting (tests that emit `.err` logs fail, even if the test function returns success)
+- `--seed=N` argument for `std.testing.random_seed` (printed in the summary for reproducibility)
+- Exit code 0 = all passed, 1 = any failure or leak
 
 ## Panic handling
 
-ztest includes a custom panic handler that prevents a known issue in Zig
-0.15.x where `std.debug.dumpCurrentStackTrace` can loop forever at 100% CPU
-on certain platforms (notably aarch64-linux in VMs), making test panics appear
-as hangs. See [ziglang/zig#18286](https://github.com/ziglang/zig/issues/18286).
+`std.debug.dumpCurrentStackTrace` can [loop forever at 100% CPU](https://github.com/ziglang/zig/issues/18286) on aarch64-linux in VMs when a test panics. The fix landed in Zig master but not 0.15.x.
 
-Instead of calling `std.debug.defaultPanic` (which triggers the infinite loop),
-ztest walks the stack with a hard frame limit (64 frames) and exits
-immediately. The panic message, test name, and a bounded stack trace are still
-printed to stderr.
-
-## What it drops
-
-- `std.Progress` TUI (the whole point)
-- The stdin/stdout server protocol (by using `.mode = .simple`)
-- **Fuzz mode** (`zig build test --fuzz`) — this requires the server protocol
-  to communicate coverage data and receive fuzzing commands. ztest runs fuzz
-  tests in corpus-only mode (just runs the provided corpus inputs), which is
-  what you want for normal test runs. For actual fuzzing, use the default runner.
+ztest's panic handler walks the stack with a hard 64-frame limit instead of calling `std.debug.defaultPanic`. The panic message, test name, and a bounded stack trace still print to stderr. A recursive-panic guard prevents re-entry if the stack walk itself panics.
 
 ## Fuzz testing
 
-ztest supports fuzz tests — `std.testing.fuzz()` works and runs the provided
-corpus inputs as normal test calls. This covers the common case: running tests
-in CI or with an agent, where you want the corpus validated but don't need
-actual fuzzing.
+`std.testing.fuzz()` works. In non-fuzz mode (normal `zig build test`), it runs the provided corpus inputs as regular test calls and the main test loop handles leak detection.
 
-For actual fuzzing (`zig build test --fuzz`), the build system needs the server
-protocol, which ztest's `.mode = .simple` bypasses. Use a conditional test runner
-in your `build.zig`:
+For actual fuzzing (`zig build test --fuzz`), the build system needs the server protocol, which `.mode = .simple` bypasses. Use a conditional runner in `build.zig`:
 
 ```zig
 const ztest = b.dependency("ztest", .{});
 
-// Use ztest for normal test runs, default runner for fuzzing.
 const fuzz_mode = b.option(bool, "fuzz", "Enable fuzzing") orelse false;
 
 const tests = b.addTest(.{
@@ -149,13 +111,10 @@ const tests = b.addTest(.{
 });
 ```
 
-Then:
-- `zig build test` — uses ztest (clean output, agent-friendly)
-- `zig build test --fuzz` — uses the default runner (fuzz mode)
-- `zig build test -Dfuzz` — uses the default runner (fuzz mode, if using the option above)
+- `zig build test` uses ztest
+- `zig build test -Dfuzz` uses the default runner
 
-**Note:** If you use `--fuzz` without the conditional, ztest will panic with a
-clear message explaining that fuzz mode requires the default runner.
+If you run `--fuzz` without the conditional, ztest panics with a message pointing you to the default runner.
 
 ## License
 
