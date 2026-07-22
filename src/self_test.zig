@@ -37,15 +37,12 @@ test "friendlyName handles edge case: test_foo in nested module" {
 }
 
 test "friendlyName strips named test that looks like test_N" {
-    // A test named "test_42" should NOT be treated as an unnamed test.
-    // The builtin name would be "module.test.test_42" — the remainder after
-    // ".test_" is "42" which parses as a number, BUT this is a named test
-    // because the user wrote test "test_42". We can't distinguish this from
-    // a true unnamed test at this level, so we accept this edge case.
-    // However, "module.test.test_42_extra" should NOT match because
-    // "42_extra" doesn't parse as a u32.
-    const name = "module.test.test_42_extra";
-    try std.testing.expectEqualStrings("test_42_extra", friendlyName(name));
+    // A test named "test_42" should be stripped to "test_42", not treated
+    // as an unnamed test. The builtin name is "module.test.test_42" which
+    // has a ".test." separator — unnamed tests have ".test_0" with no
+    // ".test." segment.
+    const name = "module.test.test_42";
+    try std.testing.expectEqualStrings("test_42", friendlyName(name));
 }
 
 test "basic arithmetic passes" {
@@ -96,14 +93,6 @@ fn fuzzCallback(_: @TypeOf(.{}), input: []const u8) anyerror!void {
 // ── Internal helpers (copied from test_runner.zig for testing) ──────────────
 
 fn friendlyName(name: []const u8) []const u8 {
-    const marker = ".test_";
-    if (std.mem.indexOf(u8, name, marker)) |idx| {
-        const remainder = name[idx + marker.len ..];
-        if (std.fmt.parseInt(u32, remainder, 10)) |_| {
-            return name;
-        } else |_| {}
-    }
-
     var it = std.mem.splitScalar(u8, name, '.');
     while (it.next()) |segment| {
         if (std.mem.eql(u8, segment, "test")) {
