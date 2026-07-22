@@ -1,0 +1,308 @@
+//! ztest — a custom test runner for Zig that produces clean, parseable output.
+//!
+//! Designed for both humans (TTY with color) and agents/CI (non-TTY, one line
+//! per test, inline stack traces). Replaces Zig's built-in test runner which
+//! uses a TUI progress display that is hostile to non-interactive consumers.
+//!
+//! Usage in build.zig:
+//!   const ztest = b.dependency("ztest", .{});
+//!   const tests = b.addTest(.{
+//!       .root_module = my_module,
+//!       .test_runner = .{ .path = ztest.path("src/test_runner.zig"), .mode = .simple },
+//!   });
+//!
+//! Or with zig test directly:
+//!   zig test --test-runner src/test_runner.zig foo.zig
+//!
+//! Environment variables:
+//!   ZTEST_VERBOSE=1|0   Override verbose detection (default: auto — on for non-TTY, off for TTY)
+//!   ZTEST_PLAIN=1       Force non-TTY format: no ANSI colors, always verbose
+//!   ZTEST_FAIL_FAST=1   Stop on first failure
+//!   ZTEST_FILTER=substr Only run tests whose name contains substr
+
+const std = @import("std");
+const builtin = @import("builtin");
+
+var current_test: ?[]const u8 = null;
+
+pub const panic = std.debug.FullPanic(struct {
+    pub fn panicFn(msg: []const u8, first_trace_addr: ?usize) noreturn {
+        if (current_test) |ct| {
+            std.debug.print("PANIC in test \"{s}\": {s}\n", .{ ct, msg });
+        }
+        std.debug.defaultPanic(msg, first_trace_addr);
+    }
+}.panicFn);
+
+pub fn main() !void {
+    var mem: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&mem);
+    const allocator = fba.allocator();
+
+    // Parse --seed=N argument (passed by zig test / zig build test).
+    var args = std.process.args();
+    _ = args.skip();
+    while (args.next()) |arg| {
+        if (std.mem.startsWith(u8, arg, "--seed=")) {
+            testing.random_seed = std.fmt.parseUnsigned(u32, arg["--seed=".len..], 0) catch
+                @panic("unable to parse --seed command line argument");
+        }
+        // Ignore other args (--listen, --cache-dir, etc.) — not relevant in simple mode.
+    }
+
+    if (builtin.test_functions.len == 0) {
+        print("no tests found\n", .{});
+        return;
+    }
+
+    const env = Env.init(allocator);
+    defer env.deinit(allocator);
+
+    const have_tty = stderr.isTty();
+    const plain = env.plain or !have_tty;
+    const verbose = env.verbose orelse plain;
+
+    const total = builtin.test_functions.len;
+    const timer = std.time.Timer.start() catch null;
+
+    print("ztest: Running {d} test{s}...\n", .{ total, if (total != 1) "s" else "" });
+    if (!verbose) print("\n", .{});
+
+    var pass: usize = 0;
+    var fail: usize = 0;
+    var skip: usize = 0;
+    var leak: usize = 0;
+
+    for (builtin.test_functions, 0..) |t, i| {
+        const name = friendlyName(t.name);
+
+        // Apply filter.
+        if (env.filter) |f| {
+            if (std.mem.indexOf(u8, t.name, f) == null) continue;
+        }
+
+        current_test = name;
+        testing.allocator_instance = .{};
+        testing.log_level = .warn;
+
+        var test_timer = std.time.Timer.start() catch null;
+        const result = t.func();
+
+        current_test = null;
+        const leaked = testing.allocator_instance.deinit() == .leak;
+
+        const ns = if (test_timer) |*tt| tt.read() else 0;
+        const idx = i + 1;
+
+        if (result) |_| {
+            pass += 1;
+            if (verbose) {
+                printStatus(.pass, idx, total, name, ns, null, plain);
+            } else {
+                dot(.pass, plain);
+            }
+        } else |err| switch (err) {
+            error.SkipZigTest => {
+                skip += 1;
+                if (verbose) {
+                    printStatus(.skip, idx, total, name, ns, null, plain);
+                } else {
+                    dot(.skip, plain);
+                }
+            },
+            else => {
+                fail += 1;
+                if (verbose) {
+                    printStatus(.fail, idx, total, name, ns, @errorName(err), plain);
+                    if (@errorReturnTrace()) |trace| {
+                        std.debug.dumpStackTrace(trace.*);
+                    }
+                } else {
+                    dot(.fail, plain);
+                    print("\n", .{});
+                    printStatus(.fail, idx, total, name, ns, @errorName(err), plain);
+                    if (@errorReturnTrace()) |trace| {
+                        std.debug.dumpStackTrace(trace.*);
+                    }
+                    print("\n", .{});
+                }
+                if (env.fail_fast) {
+                    break;
+                }
+            },
+        }
+
+        if (leaked) {
+            leak += 1;
+            if (verbose) {
+                printStatus(.leak, idx, total, name, ns, null, plain);
+            } else {
+                dot(.leak, plain);
+            }
+        }
+    }
+
+    if (!verbose) print("\n", .{});
+
+    var timer_mut = timer;
+    const elapsed_ns: u64 = if (timer_mut) |*t| t.read() else 0;
+    const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
+
+    print("\nztest: {d} passed, {d} failed, {d} skipped", .{ pass, fail, skip });
+    if (leak > 0) print(", {d} leaked", .{leak});
+    print(" (of {d} total) in {d:.0}ms\n", .{ total, elapsed_ms });
+
+    if (fail == 0 and leak == 0) {
+        print("ALL TESTS PASSED\n", .{});
+    } else {
+        print("TESTS FAILED\n", .{});
+    }
+
+    if (fail != 0 or leak != 0) {
+        std.posix.exit(1);
+    }
+}
+
+// ── Output ──────────────────────────────────────────────────────────────────
+
+const stderr = std.fs.File.stderr();
+
+const Status = enum { pass, fail, skip, leak };
+
+fn print(comptime fmt: []const u8, args: anytype) void {
+    std.debug.print(fmt, args);
+}
+
+fn dot(status: Status, plain: bool) void {
+    const ch: u8 = switch (status) {
+        .pass => '.',
+        .fail => 'F',
+        .skip => 'S',
+        .leak => 'L',
+    };
+    if (plain) {
+        print("{c}", .{ch});
+    } else {
+        const color = switch (status) {
+            .pass => "\x1b[32m",
+            .fail => "\x1b[31m",
+            .skip => "\x1b[33m",
+            .leak => "\x1b[31m",
+        };
+        print("{s}{c}\x1b[0m", .{ color, ch });
+    }
+}
+
+fn printStatus(
+    status: Status,
+    idx: usize,
+    total: usize,
+    name: []const u8,
+    ns: u64,
+    err_name: ?[]const u8,
+    plain: bool,
+) void {
+    const label = switch (status) {
+        .pass => "PASS",
+        .fail => "FAIL",
+        .skip => "SKIP",
+        .leak => "LEAK",
+    };
+
+    const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
+
+    if (plain) {
+        if (err_name) |e| {
+            print("[{d}/{d}] {s}: {s} — error.{s}\n", .{ idx, total, label, name, e });
+        } else {
+            print("[{d}/{d}] {s}: {s}\n", .{ idx, total, label, name });
+        }
+    } else {
+        const color = switch (status) {
+            .pass => "\x1b[32m", // green
+            .fail => "\x1b[31m", // red
+            .skip => "\x1b[33m", // yellow
+            .leak => "\x1b[31m", // red
+        };
+        if (err_name) |e| {
+            print("[{d}/{d}] {s}{s}\x1b[0m: {s} — error.{s} ({d:.2}ms)\n", .{
+                idx, total, color, label, name, e, ms,
+            });
+        } else {
+            print("[{d}/{d}] {s}{s}\x1b[0m: {s} ({d:.2}ms)\n", .{ idx, total, color, label, name, ms });
+        }
+    }
+}
+
+// ── Test name formatting ────────────────────────────────────────────────────
+
+/// Extract a human-friendly test name from the fully-qualified builtin name.
+/// e.g. "myapp.parser.test.parseJson" -> "parseJson"
+///      "myapp.parser.test_0"         -> "myapp.parser.test_0" (unnamed, keep full)
+fn friendlyName(name: []const u8) []const u8 {
+    const marker = ".test_";
+    // Keep unnamed tests (test_0, test_1, ...) as the full name.
+    if (std.mem.indexOf(u8, name, marker)) |idx| {
+        if (std.fmt.parseInt(u32, name[idx + marker.len ..], 10)) |_| {
+            return name;
+        } else |_| {}
+    }
+
+    // Strip everything up to and including ".test." for named tests.
+    var it = std.mem.splitScalar(u8, name, '.');
+    while (it.next()) |segment| {
+        if (std.mem.eql(u8, segment, "test")) {
+            const rest = it.rest();
+            return if (rest.len > 0) rest else name;
+        }
+    }
+    return name;
+}
+
+// ── Environment variables ───────────────────────────────────────────────────
+
+const Env = struct {
+    verbose: ?bool,
+    plain: bool,
+    fail_fast: bool,
+    filter: ?[]const u8,
+
+    fn init(allocator: std.mem.Allocator) Env {
+        return .{
+            .verbose = readEnvBool(allocator, "ZTEST_VERBOSE"),
+            .plain = readEnvBoolDefault(allocator, "ZTEST_PLAIN", false),
+            .fail_fast = readEnvBoolDefault(allocator, "ZTEST_FAIL_FAST", false),
+            .filter = readEnv(allocator, "ZTEST_FILTER"),
+        };
+    }
+
+    fn deinit(self: Env, allocator: std.mem.Allocator) void {
+        if (self.filter) |f| allocator.free(f);
+    }
+};
+
+fn readEnv(allocator: std.mem.Allocator, key: []const u8) ?[]const u8 {
+    const v = std.process.getEnvVarOwned(allocator, key) catch |err| {
+        if (err == error.EnvironmentVariableNotFound) return null;
+        return null;
+    };
+    return v;
+}
+
+fn readEnvBool(allocator: std.mem.Allocator, key: []const u8) ?bool {
+    const value = readEnv(allocator, key) orelse return null;
+    defer allocator.free(value);
+    if (std.ascii.eqlIgnoreCase(value, "1") or std.ascii.eqlIgnoreCase(value, "true"))
+        return true;
+    if (std.ascii.eqlIgnoreCase(value, "0") or std.ascii.eqlIgnoreCase(value, "false"))
+        return false;
+    return null;
+}
+
+fn readEnvBoolDefault(allocator: std.mem.Allocator, key: []const u8, default: bool) bool {
+    return readEnvBool(allocator, key) orelse default;
+}
+
+// ── Aliases ─────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
