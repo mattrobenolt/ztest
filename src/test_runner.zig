@@ -24,12 +24,36 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 var current_test: ?[]const u8 = null;
+var log_err_count: usize = 0;
+var random_seed: u32 = 0;
 
 /// Maximum number of stack frames to attempt to resolve during a panic.
 /// This prevents infinite loops in StackIterator on platforms where the
 /// stack frame chain is circular (e.g. aarch64-linux in VMs).
 /// See https://github.com/ziglang/zig/issues/18286
 const max_panic_frames = 64;
+
+/// Root-level log function. std.log calls @import("root").logFn, which defaults
+/// to this. We count .err level messages so we can fail tests that emit error
+/// logs even if the test function itself returns success — matching the
+/// built-in runner's behavior.
+pub const std_options: std.Options = .{
+    .logFn = log,
+};
+
+pub fn log(
+    comptime message_level: std.log.Level,
+    comptime scope: @Type(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    if (@intFromEnum(message_level) <= @intFromEnum(std.log.Level.err)) {
+        log_err_count +|= 1;
+    }
+    if (@intFromEnum(message_level) <= @intFromEnum(testing.log_level)) {
+        print("[" ++ @tagName(scope) ++ "] (" ++ @tagName(message_level) ++ "): " ++ format ++ "\n", args);
+    }
+}
 
 pub const panic = std.debug.FullPanic(struct {
     pub fn panicFn(msg: []const u8, first_trace_addr: ?usize) noreturn {
@@ -100,8 +124,9 @@ pub fn main() !void {
     _ = args.skip();
     while (args.next()) |arg| {
         if (std.mem.startsWith(u8, arg, "--seed=")) {
-            testing.random_seed = std.fmt.parseUnsigned(u32, arg["--seed=".len..], 0) catch
+            random_seed = std.fmt.parseUnsigned(u32, arg["--seed=".len..], 0) catch
                 @panic("unable to parse --seed command line argument");
+            testing.random_seed = random_seed;
         }
         // Ignore other args (--listen, --cache-dir, etc.) — not relevant in simple mode.
     }
@@ -128,6 +153,7 @@ pub fn main() !void {
     var fail: usize = 0;
     var skip: usize = 0;
     var leak: usize = 0;
+    var log_errs: usize = 0;
 
     for (builtin.test_functions, 0..) |t, i| {
         const name = friendlyName(t.name);
@@ -140,22 +166,44 @@ pub fn main() !void {
         current_test = name;
         testing.allocator_instance = .{};
         testing.log_level = .warn;
+        log_err_count = 0;
 
         var test_timer = std.time.Timer.start() catch null;
         const result = t.func();
 
         current_test = null;
+        // Capture log_err_count BEFORE deinit — deinit calls detectLeaks which
+        // logs leaks at .err level, and we don't want those to contaminate the
+        // test's own error log count.
+        const test_log_errs = log_err_count;
         const leaked = testing.allocator_instance.deinit() == .leak;
 
         const ns = if (test_timer) |*tt| tt.read() else 0;
         const idx = i + 1;
 
+        // Error logs count as a test failure, even if the test function returned success.
+        // This matches the built-in runner's behavior.
         if (result) |_| {
-            pass += 1;
-            if (verbose) {
-                printStatus(.pass, idx, total, name, ns, null, plain);
+            if (test_log_errs != 0) {
+                fail += 1;
+                log_errs += test_log_errs;
+                if (verbose) {
+                    printStatus(.fail, idx, total, name, ns, "ErrorLogEmitted", plain);
+                    print("  {d} error log{s} emitted during test\n", .{ test_log_errs, if (test_log_errs != 1) "s" else "" });
+                } else {
+                    dot(.fail, plain);
+                    print("\n", .{});
+                    printStatus(.fail, idx, total, name, ns, "ErrorLogEmitted", plain);
+                    print("  {d} error log{s} emitted during test\n", .{ test_log_errs, if (test_log_errs != 1) "s" else "" });
+                    print("\n", .{});
+                }
             } else {
-                dot(.pass, plain);
+                pass += 1;
+                if (verbose) {
+                    printStatus(.pass, idx, total, name, ns, null, plain);
+                } else {
+                    dot(.pass, plain);
+                }
             }
         } else |err| switch (err) {
             error.SkipZigTest => {
@@ -168,6 +216,7 @@ pub fn main() !void {
             },
             else => {
                 fail += 1;
+                log_errs += test_log_errs;
                 if (verbose) {
                     printStatus(.fail, idx, total, name, ns, @errorName(err), plain);
                     if (@errorReturnTrace()) |trace| {
@@ -206,7 +255,10 @@ pub fn main() !void {
 
     print("\nztest: {d} passed, {d} failed, {d} skipped", .{ pass, fail, skip });
     if (leak > 0) print(", {d} leaked", .{leak});
-    print(" (of {d} total) in {d:.0}ms\n", .{ total, elapsed_ms });
+    if (log_errs > 0) print(", {d} error logs", .{log_errs});
+    print(" (of {d} total) in {d:.0}ms", .{ total, elapsed_ms });
+    if (random_seed != 0) print(" (seed: 0x{x})", .{random_seed});
+    print("\n", .{});
 
     if (fail == 0 and leak == 0) {
         print("ALL TESTS PASSED\n", .{});
@@ -214,7 +266,7 @@ pub fn main() !void {
         print("TESTS FAILED\n", .{});
     }
 
-    if (fail != 0 or leak != 0) {
+    if (fail != 0 or leak != 0 or log_errs != 0) {
         std.posix.exit(1);
     }
 }
@@ -269,9 +321,9 @@ fn printStatus(
 
     if (plain) {
         if (err_name) |e| {
-            print("[{d}/{d}] {s}: {s} — error.{s}\n", .{ idx, total, label, name, e });
+            print("[{d}/{d}] {s}: {s} — error.{s} ({d:.2}ms)\n", .{ idx, total, label, name, e, ms });
         } else {
-            print("[{d}/{d}] {s}: {s}\n", .{ idx, total, label, name });
+            print("[{d}/{d}] {s}: {s} ({d:.2}ms)\n", .{ idx, total, label, name, ms });
         }
     } else {
         const color = switch (status) {
@@ -298,8 +350,11 @@ fn printStatus(
 fn friendlyName(name: []const u8) []const u8 {
     const marker = ".test_";
     // Keep unnamed tests (test_0, test_1, ...) as the full name.
+    // Unnamed tests are always exactly ".test_N" with nothing after the number,
+    // so we check that the remainder after the marker is purely digits.
     if (std.mem.indexOf(u8, name, marker)) |idx| {
-        if (std.fmt.parseInt(u32, name[idx + marker.len ..], 10)) |_| {
+        const remainder = name[idx + marker.len ..];
+        if (std.fmt.parseInt(u32, remainder, 10)) |_| {
             return name;
         } else |_| {}
     }
@@ -387,13 +442,38 @@ pub fn fuzz(
 
     // When not in fuzz mode, just run the corpus as normal test calls.
     // This is the path that matters for ztest — agents and CI run tests,
-    // they don't fuzz.
+    // they don't fuzz. We reset the allocator and log_err_count before each
+    // input so leaks and error logs are attributed to the right input.
     if (!builtin.fuzz) {
         for (options.corpus) |input| {
+            testing.allocator_instance = .{};
+            log_err_count = 0;
             try testOne(context, input);
+            if (testing.allocator_instance.deinit() == .leak) {
+                print("ztest: fuzz corpus input leaked memory: {s}\n", .{input});
+                return error.TestUnexpectedResult;
+            }
+            if (log_err_count != 0) {
+                print("ztest: fuzz corpus input emitted {d} error log(s): {s}\n", .{ log_err_count, input });
+                return error.TestUnexpectedResult;
+            }
         }
         // Smoke test with empty input if no corpus was provided.
-        try testOne(context, "");
+        if (options.corpus.len == 0) {
+            testing.allocator_instance = .{};
+            log_err_count = 0;
+            try testOne(context, "");
+            if (testing.allocator_instance.deinit() == .leak) {
+                print("ztest: fuzz smoke test (empty input) leaked memory\n", .{});
+                return error.TestUnexpectedResult;
+            }
+            if (log_err_count != 0) {
+                print("ztest: fuzz smoke test (empty input) emitted {d} error log(s)\n", .{log_err_count});
+                return error.TestUnexpectedResult;
+            }
+        }
+        // Re-initialize so the main test loop's deinit sees clean state.
+        testing.allocator_instance = .{};
         return;
     }
 

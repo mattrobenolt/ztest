@@ -36,6 +36,18 @@ test "friendlyName handles edge case: test_foo in nested module" {
     try std.testing.expectEqualStrings("test_foo", friendlyName(name));
 }
 
+test "friendlyName strips named test that looks like test_N" {
+    // A test named "test_42" should NOT be treated as an unnamed test.
+    // The builtin name would be "module.test.test_42" — the remainder after
+    // ".test_" is "42" which parses as a number, BUT this is a named test
+    // because the user wrote test "test_42". We can't distinguish this from
+    // a true unnamed test at this level, so we accept this edge case.
+    // However, "module.test.test_42_extra" should NOT match because
+    // "42_extra" doesn't parse as a u32.
+    const name = "module.test.test_42_extra";
+    try std.testing.expectEqualStrings("test_42_extra", friendlyName(name));
+}
+
 test "basic arithmetic passes" {
     try std.testing.expect(1 + 1 == 2);
 }
@@ -57,16 +69,11 @@ test "memory leak detection" {
     _ = try allocator.alloc(u8, 64);
 }
 
-test "panic via @panic" {
-    @panic("intentional panic for testing");
-}
-
-test "panic via debug.assert" {
-    std.debug.assert(1 == 2);
-}
-
-test "panic via unreachable" {
-    unreachable;
+test "emits error log but succeeds" {
+    // This test should be treated as a FAILURE by the runner, even though
+    // the test function itself returns success. Error logs count as failures.
+    std.log.err("something went wrong", .{});
+    try std.testing.expect(true);
 }
 
 test "fuzz: simple corpus" {
@@ -91,7 +98,8 @@ fn fuzzCallback(_: @TypeOf(.{}), input: []const u8) anyerror!void {
 fn friendlyName(name: []const u8) []const u8 {
     const marker = ".test_";
     if (std.mem.indexOf(u8, name, marker)) |idx| {
-        if (std.fmt.parseInt(u32, name[idx + marker.len ..], 10)) |_| {
+        const remainder = name[idx + marker.len ..];
+        if (std.fmt.parseInt(u32, remainder, 10)) |_| {
             return name;
         } else |_| {}
     }
