@@ -255,6 +255,22 @@ pub fn main() !void {
 
         current_test = name;
         testing.allocator_instance = .{};
+        // Mirror the default runner: tests may use std.testing.io (process
+        // spawn, file I/O, timestamps), which derefs io_instance. Without
+        // this init the first such test segfaults in the allocator. The
+        // environ comes from the C environ block because a simple-mode main
+        // receives no Init.Minimal — an empty block means default PATH, and
+        // spawned children (openssl in interop tests) would not resolve.
+        if (zig_0_16) {
+            const environ: std.process.Environ = if (builtin.link_libc) blk: {
+                const c_environ = std.c.environ;
+                var n: usize = 0;
+                while (c_environ[n] != null) : (n += 1) {}
+                break :blk .{ .block = .{ .slice = c_environ[0..n :null] } };
+            } else .empty;
+            testing.environ = environ;
+            testing.io_instance = .init(testing.allocator, .{ .environ = environ });
+        }
         testing.log_level = .warn;
         log_err_count = 0;
 
@@ -268,6 +284,7 @@ pub fn main() !void {
         // last call didn't return an error.
         const test_log_errs = log_err_count;
         const trace = @errorReturnTrace();
+        if (zig_0_16) testing.io_instance.deinit();
         const leaked = testing.allocator_instance.deinit() == .leak;
 
         const ns = test_timer.read();
