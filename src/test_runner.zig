@@ -28,6 +28,11 @@ var log_err_count: usize = 0;
 var random_seed: u32 = 0;
 var panicking: bool = false;
 
+/// Zig 0.16 changed several std APIs that the runner depends on. This flag
+/// selects the right code path so a single source file works on both
+/// 0.15.x and 0.16.x.
+const zig_0_16 = builtin.zig_version.major == 0 and builtin.zig_version.minor >= 16;
+
 /// Maximum number of stack frames to attempt to resolve during a panic.
 /// This prevents infinite loops in StackIterator on platforms where the
 /// stack frame chain is circular (e.g. aarch64-linux in VMs).
@@ -44,7 +49,7 @@ pub const std_options: std.Options = .{
 
 pub fn log(
     comptime message_level: std.log.Level,
-    comptime scope: @Type(.enum_literal),
+    comptime scope: @TypeOf(.enum_literal),
     comptime format: []const u8,
     args: anytype,
 ) void {
@@ -56,12 +61,44 @@ pub fn log(
     }
 }
 
+/// Exit with a status code. 0.15 has std.posix.exit; 0.16 moved it to
+/// std.process.exit.
+fn hardExit(status: u8) noreturn {
+    if (zig_0_16) {
+        std.process.exit(status);
+    } else {
+        std.posix.exit(status);
+    }
+}
+
+/// Monotonic timer. 0.15 has std.time.Timer; 0.16 removed it, so we use
+/// libc clock_gettime(CLOCK_MONOTONIC) directly — works on both since the
+/// runner links libc.
+const Timer = struct {
+    start_ts: std.c.timespec,
+
+    fn start() Timer {
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+        return .{ .start_ts = ts };
+    }
+
+    /// Elapsed time in nanoseconds.
+    fn read(self: *const Timer) u64 {
+        var now_ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &now_ts);
+        const sec: u64 = @intCast(now_ts.sec - self.start_ts.sec);
+        const nsec: u64 = @intCast(now_ts.nsec);
+        return sec * std.time.ns_per_s + nsec;
+    }
+};
+
 pub const panic = std.debug.FullPanic(struct {
     pub fn panicFn(msg: []const u8, first_trace_addr: ?usize) noreturn {
         // Guard against recursive panic — if dumpBoundedStackTrace itself
         // panics (e.g. corrupt debug info), don't re-enter.
         if (panicking) {
-            std.posix.exit(1);
+            hardExit(1);
         }
         panicking = true;
 
@@ -79,13 +116,38 @@ pub const panic = std.debug.FullPanic(struct {
         //
         // Instead, do a bounded stack walk that is guaranteed to terminate.
         dumpBoundedStackTrace(first_trace_addr);
-        std.posix.exit(1);
+        hardExit(1);
     }
 }.panicFn);
 
+/// Print an error return trace to stderr. 0.15's dumpStackTrace takes
+/// std.builtin.StackTrace by value; 0.16 split it into dumpErrorReturnTrace
+/// (for builtin.StackTrace) and dumpStackTrace (for debug.StackTrace).
+fn dumpTrace(trace: ?*std.builtin.StackTrace) void {
+    if (trace) |tr| {
+        if (zig_0_16) {
+            std.debug.dumpErrorReturnTrace(tr);
+        } else {
+            std.debug.dumpStackTrace(tr.*);
+        }
+    }
+}
+
 /// Walk the stack with a hard frame limit. Resolves source locations when
 /// debug info is available, but never loops more than `max_panic_frames` times.
+///
+/// On 0.16 the internal StackIterator/printSourceAtAddress APIs are private,
+/// so we print the panic address only. The error-return-trace path (via
+/// `std.debug.dumpStackTrace`) still gets full source resolution on both.
 fn dumpBoundedStackTrace(start_addr: ?usize) void {
+    if (zig_0_16) {
+        if (start_addr) |addr| {
+            print("  panic address: 0x{x}\n", .{addr});
+        }
+        return;
+    }
+
+    // 0.15 path: full bounded stack walk with source resolution.
     if (builtin.strip_debug_info) {
         print("  (debug info stripped, no stack trace available)\n", .{});
         return;
@@ -128,15 +190,20 @@ pub fn main() !void {
     const allocator = fba.allocator();
 
     // Parse --seed=N argument (passed by zig test / zig build test).
-    var args = std.process.args();
-    _ = args.skip();
-    while (args.next()) |arg| {
-        if (std.mem.startsWith(u8, arg, "--seed=")) {
-            random_seed = std.fmt.parseUnsigned(u32, arg["--seed=".len..], 0) catch
-                @panic("unable to parse --seed command line argument");
-            testing.random_seed = random_seed;
+    // 0.16 removed std.process.args(); args are only available via the main
+    // function parameter, which .mode = .simple doesn't use. Seed parsing is
+    // a convenience — skip it on 0.16 where the API is unavailable.
+    if (!zig_0_16) {
+        var args = std.process.args();
+        _ = args.skip();
+        while (args.next()) |arg| {
+            if (std.mem.startsWith(u8, arg, "--seed=")) {
+                random_seed = std.fmt.parseUnsigned(u32, arg["--seed=".len..], 0) catch
+                    @panic("unable to parse --seed command line argument");
+                testing.random_seed = random_seed;
+            }
+            // Ignore other args (--listen, --cache-dir, etc.) — not relevant in simple mode.
         }
-        // Ignore other args (--listen, --cache-dir, etc.) — not relevant in simple mode.
     }
 
     if (builtin.test_functions.len == 0) {
@@ -147,7 +214,7 @@ pub fn main() !void {
     const env = Env.init(allocator);
     defer env.deinit(allocator);
 
-    const have_tty = stderr.isTty();
+    const have_tty = isStderrTty();
     const plain = env.plain or !have_tty;
     const verbose = env.verbose orelse plain;
 
@@ -161,7 +228,7 @@ pub fn main() !void {
         break :blk count;
     } else builtin.test_functions.len;
 
-    const timer = std.time.Timer.start() catch null;
+    const timer = Timer.start();
 
     print("ztest: Running {d} test{s}...\n", .{ total, if (total != 1) "s" else "" });
     if (!verbose) print("\n", .{});
@@ -191,7 +258,7 @@ pub fn main() !void {
         testing.log_level = .warn;
         log_err_count = 0;
 
-        var test_timer = std.time.Timer.start() catch null;
+        var test_timer = Timer.start();
         const result = t.func();
 
         current_test = null;
@@ -203,7 +270,7 @@ pub fn main() !void {
         const trace = @errorReturnTrace();
         const leaked = testing.allocator_instance.deinit() == .leak;
 
-        const ns = if (test_timer) |*tt| tt.read() else 0;
+        const ns = test_timer.read();
         const idx = run_idx;
 
         // Error logs count as a test failure, even if the test function returned
@@ -254,16 +321,12 @@ pub fn main() !void {
                 fail += 1;
                 if (verbose) {
                     printStatus(.fail, idx, total, name, ns, @errorName(err), plain);
-                    if (trace) |tr| {
-                        std.debug.dumpStackTrace(tr.*);
-                    }
+                    dumpTrace(trace);
                 } else {
                     dot(.fail, plain);
                     print("\n", .{});
                     printStatus(.fail, idx, total, name, ns, @errorName(err), plain);
-                    if (trace) |tr| {
-                        std.debug.dumpStackTrace(tr.*);
-                    }
+                    dumpTrace(trace);
                     print("\n", .{});
                 }
                 if (env.fail_fast) should_stop = true;
@@ -283,8 +346,7 @@ pub fn main() !void {
 
     if (!verbose) print("\n", .{});
 
-    var timer_mut = timer;
-    const elapsed_ns: u64 = if (timer_mut) |*t| t.read() else 0;
+    const elapsed_ns: u64 = timer.read();
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
 
     print("\nztest: {d} passed, {d} failed, {d} skipped", .{ pass, fail, skip });
@@ -301,13 +363,17 @@ pub fn main() !void {
     }
 
     if (fail != 0 or leak != 0 or log_errs != 0) {
-        std.posix.exit(1);
+        hardExit(1);
     }
 }
 
 // ── Output ──────────────────────────────────────────────────────────────────
 
-const stderr = std.fs.File.stderr();
+/// Check whether stderr is a TTY. Uses libc isatty(2) — works on both 0.15
+/// and 0.16 since the test runner links libc.
+fn isStderrTty() bool {
+    return std.c.isatty(2) != 0;
+}
 
 const Status = enum { pass, fail, skip, leak };
 
@@ -423,11 +489,14 @@ const Env = struct {
 };
 
 fn readEnv(allocator: std.mem.Allocator, key: []const u8) ?[]const u8 {
-    const v = std.process.getEnvVarOwned(allocator, key) catch |err| {
-        if (err == error.EnvironmentVariableNotFound) return null;
-        return null;
-    };
-    return v;
+    // Use libc getenv — works on both 0.15 and 0.16 since the test runner
+    // links libc. Returns a pointer to the env var value (NUL-terminated) or
+    // null if not set.
+    const key_z = allocator.dupeZ(u8, key) catch return null;
+    defer allocator.free(key_z);
+    const raw = std.c.getenv(key_z) orelse return null;
+    const value = std.mem.sliceTo(raw, 0);
+    return allocator.dupe(u8, value) catch null;
 }
 
 fn readEnvBool(allocator: std.mem.Allocator, key: []const u8) ?bool {
@@ -465,7 +534,7 @@ extern fn fuzzer_start(testOne: *const fn ([*]const u8, usize) callconv(.c) void
 
 pub fn fuzz(
     context: anytype,
-    comptime testOne: fn (context: @TypeOf(context), input: []const u8) anyerror!void,
+    comptime testOne: anytype,
     options: testing.FuzzInputOptions,
 ) anyerror!void {
     @disableInstrumentation();
@@ -474,12 +543,31 @@ pub fn fuzz(
     // loop owns allocator teardown and leak detection — we don't touch the
     // allocator here, matching the default runner's non-fuzz behavior.
     if (!builtin.fuzz) {
-        for (options.corpus) |input| {
-            try testOne(context, input);
-        }
-        // Smoke test with empty input if no corpus was provided.
-        if (options.corpus.len == 0) {
-            try testOne(context, "");
+        if (zig_0_16) {
+            // 0.16: testOne takes *testing.Smith. Smith.slice expects a
+            // 4-byte little-endian length prefix followed by the data, so
+            // construct a compatible buffer for each corpus entry.
+            const max_smith_input = 65536;
+            for (options.corpus) |input| {
+                var buf: [max_smith_input + 4]u8 = undefined;
+                const data_len = @min(input.len, max_smith_input);
+                std.mem.writeInt(u32, buf[0..4], @intCast(data_len), .little);
+                @memcpy(buf[4..][0..data_len], input[0..data_len]);
+                var smith = testing.Smith{ .in = buf[0 .. 4 + data_len] };
+                try testOne(context, &smith);
+            }
+            if (options.corpus.len == 0) {
+                var smith = testing.Smith{ .in = &.{} };
+                try testOne(context, &smith);
+            }
+        } else {
+            // 0.15: testOne takes []const u8. Run corpus directly.
+            for (options.corpus) |input| {
+                try testOne(context, input);
+            }
+            if (options.corpus.len == 0) {
+                try testOne(context, "");
+            }
         }
         return;
     }
