@@ -25,6 +25,20 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run ztest's own tests");
     test_step.dependOn(&run_tests.step);
 
+    // Timer arithmetic tests. timer.zig is also imported by the test runner
+    // itself, and a file can't be imported by both the runner and a test root
+    // (they'd land in two modules of one compilation), so it gets its own
+    // test target using the built-in runner.
+    const timer_mod = b.createModule(.{
+        .root_source_file = b.path("src/timer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    timer_mod.link_libc = true;
+    const timer_tests = b.addTest(.{ .root_module = timer_mod });
+    const run_timer_tests = b.addRunArtifact(timer_tests);
+    test_step.dependOn(&run_timer_tests.step);
+
     // Example: demonstrates a consumer project using ztest as a dependency.
     const example_step = b.step("example", "Run the example test suite");
     const run_example = b.addSystemCommand(&.{ "zig", "build", "test" });
