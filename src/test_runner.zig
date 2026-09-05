@@ -71,27 +71,8 @@ fn hardExit(status: u8) noreturn {
     }
 }
 
-/// Monotonic timer. 0.15 has std.time.Timer; 0.16 removed it, so we use
-/// libc clock_gettime(CLOCK_MONOTONIC) directly — works on both since the
-/// runner links libc.
-const Timer = struct {
-    start_ts: std.c.timespec,
-
-    fn start() Timer {
-        var ts: std.c.timespec = undefined;
-        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
-        return .{ .start_ts = ts };
-    }
-
-    /// Elapsed time in nanoseconds.
-    fn read(self: *const Timer) u64 {
-        var now_ts: std.c.timespec = undefined;
-        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &now_ts);
-        const sec: u64 = @intCast(now_ts.sec - self.start_ts.sec);
-        const nsec: u64 = @intCast(now_ts.nsec);
-        return sec * std.time.ns_per_s + nsec;
-    }
-};
+/// Monotonic timer (see timer.zig).
+const Timer = @import("timer.zig").Timer;
 
 pub const panic = std.debug.FullPanic(struct {
     pub fn panicFn(msg: []const u8, first_trace_addr: ?usize) noreturn {

@@ -46,6 +46,19 @@
               unset ZIG_GLOBAL_CACHE_DIR
             '';
           };
+
+          # Compiler-test shell for verifying against Zig 0.16. The default
+          # shell above stays on 0.15: `nix develop .#zig_0_16`
+          devShells.zig_0_16 = pkgs.mkShell {
+            packages = with pkgs; [
+              zig_0_16
+            ];
+
+            shellHook = ''
+              unset NIX_CFLAGS_COMPILE
+              unset ZIG_GLOBAL_CACHE_DIR
+            '';
+          };
         };
     };
 }
