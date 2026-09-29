@@ -2,9 +2,6 @@
 //! These verify the runner's own internals: name formatting, env var parsing, etc.
 
 const std = @import("std");
-const builtin = @import("builtin");
-
-const zig_0_16 = builtin.zig_version.major == 0 and builtin.zig_version.minor >= 16;
 
 test "friendlyName strips module path for named tests" {
     const name = "myapp.parser.test.parseJson";
@@ -78,8 +75,7 @@ test "emits error log but succeeds" {
 test "fuzz: simple corpus" {
     // Verify that std.testing.fuzz works with ztest — it should just run
     // the corpus inputs as normal test calls (non-fuzz mode).
-    const callback = if (zig_0_16) fuzzCallback016 else fuzzCallback015;
-    try std.testing.fuzz(.{}, callback, .{
+    try std.testing.fuzz(.{}, fuzzCallback, .{
         .corpus = &.{
             "hello",
             "world",
@@ -88,11 +84,7 @@ test "fuzz: simple corpus" {
     });
 }
 
-fn fuzzCallback015(_: @TypeOf(.{}), input: []const u8) anyerror!void {
-    _ = input;
-}
-
-fn fuzzCallback016(_: @TypeOf(.{}), smith: *std.testing.Smith) anyerror!void {
+fn fuzzCallback(_: @TypeOf(.{}), smith: *std.testing.Smith) anyerror!void {
     var buf: [256]u8 = undefined;
     _ = smith.slice(&buf);
 }

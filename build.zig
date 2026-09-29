@@ -6,8 +6,8 @@ pub fn build(b: *std.Build) void {
 
     // Self-test: use ztest's own runner to test itself.
     // The runner uses libc for env-var access and TTY detection (getenv,
-    // isatty) because the std APIs for those changed between 0.15 and 0.16
-    // and libc is the common denominator.
+    // isatty): in 0.16 those have no non-Io std API, and a simple-mode
+    // runner has no Init.Minimal. libc is the common denominator.
     const self_test_mod = b.createModule(.{
         .root_source_file = b.path("src/self_test.zig"),
         .target = target,
