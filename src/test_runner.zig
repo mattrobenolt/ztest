@@ -25,20 +25,10 @@ const builtin = @import("builtin");
 
 var current_test: ?[]const u8 = null;
 var log_err_count: usize = 0;
-var random_seed: u32 = 0;
 var panicking: bool = false;
 
-/// Zig 0.16 changed several std APIs that the runner depends on. This flag
-/// selects the right code path so a single source file works on both
-/// 0.15.x and 0.16.x.
-const zig_0_16 = builtin.zig_version.major == 0 and builtin.zig_version.minor >= 16;
-
-/// Maximum number of stack frames to attempt to resolve during a panic.
-/// This prevents infinite loops in StackIterator on platforms where the
-/// stack frame chain is circular (e.g. aarch64-linux in VMs).
-/// See https://github.com/ziglang/zig/issues/18286
-const max_panic_frames = 64;
-
+/// Requires Zig 0.16. The std.Io-era APIs (std.process.exit,
+/// std.testing.io_instance, dumpErrorReturnTrace) are used unconditionally.
 /// Root-level log function. std.log calls @import("root").logFn, which defaults
 /// to this. We count .err level messages so we can fail tests that emit error
 /// logs even if the test function itself returns success — matching the
@@ -61,19 +51,13 @@ pub fn log(
     }
 }
 
-/// Exit with a status code. 0.15 has std.posix.exit; 0.16 moved it to
-/// std.process.exit.
+/// Exit with a status code.
 fn hardExit(status: u8) noreturn {
-    if (zig_0_16) {
-        std.process.exit(status);
-    } else {
-        std.posix.exit(status);
-    }
+    std.process.exit(status);
 }
 
-/// Monotonic timer. 0.15 has std.time.Timer; 0.16 removed it, so we use
-/// libc clock_gettime(CLOCK_MONOTONIC) directly — works on both since the
-/// runner links libc.
+/// Monotonic timer. 0.16 removed std.time.Timer, so we use
+/// libc clock_gettime(CLOCK_MONOTONIC) directly — the runner links libc.
 const Timer = struct {
     start_ts: std.c.timespec,
 
@@ -120,67 +104,21 @@ pub const panic = std.debug.FullPanic(struct {
     }
 }.panicFn);
 
-/// Print an error return trace to stderr. 0.15's dumpStackTrace takes
-/// std.builtin.StackTrace by value; 0.16 split it into dumpErrorReturnTrace
-/// (for builtin.StackTrace) and dumpStackTrace (for debug.StackTrace).
+/// Print an error return trace to stderr.
 fn dumpTrace(trace: ?*std.builtin.StackTrace) void {
     if (trace) |tr| {
-        if (zig_0_16) {
-            std.debug.dumpErrorReturnTrace(tr);
-        } else {
-            std.debug.dumpStackTrace(tr.*);
-        }
+        std.debug.dumpErrorReturnTrace(tr);
     }
 }
 
-/// Walk the stack with a hard frame limit. Resolves source locations when
-/// debug info is available, but never loops more than `max_panic_frames` times.
-///
-/// On 0.16 the internal StackIterator/printSourceAtAddress APIs are private,
-/// so we print the panic address only. The error-return-trace path (via
-/// `std.debug.dumpStackTrace`) still gets full source resolution on both.
+/// Print the panic address. 0.16 made StackIterator/printSourceAtAddress
+/// private, so a bounded source-resolved walk is no longer available here.
+/// The error-return-trace path (dumpErrorReturnTrace) still gets full source
+/// resolution. Address-only output also sidesteps the StackIterator
+/// infinite-loop hazard on aarch64 VMs (ziglang/zig#18286).
 fn dumpBoundedStackTrace(start_addr: ?usize) void {
-    if (zig_0_16) {
-        if (start_addr) |addr| {
-            print("  panic address: 0x{x}\n", .{addr});
-        }
-        return;
-    }
-
-    // 0.15 path: full bounded stack walk with source resolution.
-    if (builtin.strip_debug_info) {
-        print("  (debug info stripped, no stack trace available)\n", .{});
-        return;
-    }
-
-    const debug_info = std.debug.getSelfDebugInfo() catch |err| {
-        print("  (unable to open debug info: {s})\n", .{@errorName(err)});
-        return;
-    };
-
-    var stderr_buf: [4096]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
-
-    var it = std.debug.StackIterator.init(start_addr, null);
-    defer it.deinit();
-
-    var frame: usize = 0;
-    while (frame < max_panic_frames) : (frame += 1) {
-        const return_address = it.next() orelse break;
-
-        // On arm64 macOS, the address of the last frame is 0x0 rather than
-        // 0x1 as on x86_64, so use saturating subtraction to avoid overflow.
-        const address = return_address -| 1;
-
-        // Try to resolve source location. If this fails, print the raw address.
-        std.debug.printSourceAtAddress(debug_info, &stderr_writer.interface, address, .no_color) catch {
-            print("  #{d}: 0x{x}\n", .{ frame, return_address });
-        };
-        stderr_writer.interface.flush() catch {};
-    }
-
-    if (frame == max_panic_frames) {
-        print("  ... (stopped after {d} frames to prevent infinite loop)\n", .{max_panic_frames});
+    if (start_addr) |addr| {
+        print("  panic address: 0x{x}\n", .{addr});
     }
 }
 
@@ -189,22 +127,9 @@ pub fn main() !void {
     var fba = std.heap.FixedBufferAllocator.init(&mem);
     const allocator = fba.allocator();
 
-    // Parse --seed=N argument (passed by zig test / zig build test).
-    // 0.16 removed std.process.args(); args are only available via the main
-    // function parameter, which .mode = .simple doesn't use. Seed parsing is
-    // a convenience — skip it on 0.16 where the API is unavailable.
-    if (!zig_0_16) {
-        var args = std.process.args();
-        _ = args.skip();
-        while (args.next()) |arg| {
-            if (std.mem.startsWith(u8, arg, "--seed=")) {
-                random_seed = std.fmt.parseUnsigned(u32, arg["--seed=".len..], 0) catch
-                    @panic("unable to parse --seed command line argument");
-                testing.random_seed = random_seed;
-            }
-            // Ignore other args (--listen, --cache-dir, etc.) — not relevant in simple mode.
-        }
-    }
+    // No --seed parsing: 0.16 removed std.process.args(); args are only
+    // available via the main function parameter, which .mode = .simple
+    // doesn't use.
 
     if (builtin.test_functions.len == 0) {
         print("no tests found\n", .{});
@@ -223,7 +148,7 @@ pub fn main() !void {
     const total = if (env.filter) |f| blk: {
         var count: usize = 0;
         for (builtin.test_functions) |t| {
-            if (std.mem.indexOf(u8, t.name, f) != null) count += 1;
+            if (std.mem.find(u8, t.name, f) != null) count += 1;
         }
         break :blk count;
     } else builtin.test_functions.len;
@@ -248,7 +173,7 @@ pub fn main() !void {
 
         // Apply filter.
         if (env.filter) |f| {
-            if (std.mem.indexOf(u8, t.name, f) == null) continue;
+            if (std.mem.find(u8, t.name, f) == null) continue;
         }
 
         run_idx += 1;
@@ -261,16 +186,14 @@ pub fn main() !void {
         // environ comes from the C environ block because a simple-mode main
         // receives no Init.Minimal — an empty block means default PATH, and
         // spawned children (openssl in interop tests) would not resolve.
-        if (zig_0_16) {
-            const environ: std.process.Environ = if (builtin.link_libc) blk: {
-                const c_environ = std.c.environ;
-                var n: usize = 0;
-                while (c_environ[n] != null) : (n += 1) {}
-                break :blk .{ .block = .{ .slice = c_environ[0..n :null] } };
-            } else .empty;
-            testing.environ = environ;
-            testing.io_instance = .init(testing.allocator, .{ .environ = environ });
-        }
+        const environ: std.process.Environ = if (builtin.link_libc) blk: {
+            const c_environ = std.c.environ;
+            var n: usize = 0;
+            while (c_environ[n] != null) : (n += 1) {}
+            break :blk .{ .block = .{ .slice = c_environ[0..n :null] } };
+        } else .empty;
+        testing.environ = environ;
+        testing.io_instance = .init(testing.allocator, .{ .environ = environ });
         testing.log_level = .warn;
         log_err_count = 0;
 
@@ -284,7 +207,7 @@ pub fn main() !void {
         // last call didn't return an error.
         const test_log_errs = log_err_count;
         const trace = @errorReturnTrace();
-        if (zig_0_16) testing.io_instance.deinit();
+        testing.io_instance.deinit();
         const leaked = testing.allocator_instance.deinit() == .leak;
 
         const ns = test_timer.read();
@@ -370,7 +293,6 @@ pub fn main() !void {
     if (leak > 0) print(", {d} leaked", .{leak});
     if (log_errs > 0) print(", {d} error logs", .{log_errs});
     print(" (of {d} total) in {d:.0}ms", .{ total, elapsed_ms });
-    if (random_seed != 0) print(" (seed: 0x{x})", .{random_seed});
     print("\n", .{});
 
     if (fail == 0 and leak == 0) {
@@ -386,8 +308,8 @@ pub fn main() !void {
 
 // ── Output ──────────────────────────────────────────────────────────────────
 
-/// Check whether stderr is a TTY. Uses libc isatty(2) — works on both 0.15
-/// and 0.16 since the test runner links libc.
+/// Check whether stderr is a TTY. Uses libc isatty(2) — 0.16 has no non-Io
+/// std API for it, and the runner links libc.
 fn isStderrTty() bool {
     return std.c.isatty(2) != 0;
 }
@@ -506,9 +428,9 @@ const Env = struct {
 };
 
 fn readEnv(allocator: std.mem.Allocator, key: []const u8) ?[]const u8 {
-    // Use libc getenv — works on both 0.15 and 0.16 since the test runner
-    // links libc. Returns a pointer to the env var value (NUL-terminated) or
-    // null if not set.
+    // Use libc getenv — in 0.16 there is no non-Io std API for this, and
+    // the runner links libc. Returns a pointer to the env var value
+    // (NUL-terminated) or null if not set.
     const key_z = allocator.dupeZ(u8, key) catch return null;
     defer allocator.free(key_z);
     const raw = std.c.getenv(key_z) orelse return null;
@@ -560,31 +482,21 @@ pub fn fuzz(
     // loop owns allocator teardown and leak detection — we don't touch the
     // allocator here, matching the default runner's non-fuzz behavior.
     if (!builtin.fuzz) {
-        if (zig_0_16) {
-            // 0.16: testOne takes *testing.Smith. Smith.slice expects a
-            // 4-byte little-endian length prefix followed by the data, so
-            // construct a compatible buffer for each corpus entry.
-            const max_smith_input = 65536;
-            for (options.corpus) |input| {
-                var buf: [max_smith_input + 4]u8 = undefined;
-                const data_len = @min(input.len, max_smith_input);
-                std.mem.writeInt(u32, buf[0..4], @intCast(data_len), .little);
-                @memcpy(buf[4..][0..data_len], input[0..data_len]);
-                var smith = testing.Smith{ .in = buf[0 .. 4 + data_len] };
-                try testOne(context, &smith);
-            }
-            if (options.corpus.len == 0) {
-                var smith = testing.Smith{ .in = &.{} };
-                try testOne(context, &smith);
-            }
-        } else {
-            // 0.15: testOne takes []const u8. Run corpus directly.
-            for (options.corpus) |input| {
-                try testOne(context, input);
-            }
-            if (options.corpus.len == 0) {
-                try testOne(context, "");
-            }
+        // testOne takes *testing.Smith. Smith.slice expects a 4-byte
+        // little-endian length prefix followed by the data, so construct a
+        // compatible buffer for each corpus entry.
+        const max_smith_input = 65536;
+        for (options.corpus) |input| {
+            var buf: [max_smith_input + 4]u8 = undefined;
+            const data_len = @min(input.len, max_smith_input);
+            std.mem.writeInt(u32, buf[0..4], @intCast(data_len), .little);
+            @memcpy(buf[4..][0..data_len], input[0..data_len]);
+            var smith = testing.Smith{ .in = buf[0 .. 4 + data_len] };
+            try testOne(context, &smith);
+        }
+        if (options.corpus.len == 0) {
+            var smith = testing.Smith{ .in = &.{} };
+            try testOne(context, &smith);
         }
         return;
     }
