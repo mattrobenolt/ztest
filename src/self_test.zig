@@ -1,48 +1,7 @@
-//! Self-tests for ztest's test runner.
-//! These verify the runner's own internals: name formatting, env var parsing, etc.
+//! Runner fixtures include intentional failures, a skip, and a leak.
+//! The build checks their output and exit status.
 
 const std = @import("std");
-
-test "friendlyName strips module path for named tests" {
-    const name = "myapp.parser.test.parseJson";
-    try std.testing.expectEqualStrings("parseJson", friendlyName(name));
-}
-
-test "friendlyName keeps unnamed tests as full name" {
-    const name = "myapp.parser.test_0";
-    try std.testing.expectEqualStrings("myapp.parser.test_0", friendlyName(name));
-}
-
-test "friendlyName handles deeply nested names" {
-    const name = "a.b.c.d.test.my_test";
-    try std.testing.expectEqualStrings("my_test", friendlyName(name));
-}
-
-test "friendlyName handles test at root" {
-    const name = "test.simple";
-    try std.testing.expectEqualStrings("simple", friendlyName(name));
-}
-
-test "friendlyName returns full name when no .test. segment" {
-    const name = "some.function";
-    try std.testing.expectEqualStrings("some.function", friendlyName(name));
-}
-
-test "friendlyName handles edge case: test_foo in nested module" {
-    // A test literally named "test_foo" in module "module" gets the
-    // builtin name "module.test.test_foo" — .test. separator is present.
-    const name = "module.test.test_foo";
-    try std.testing.expectEqualStrings("test_foo", friendlyName(name));
-}
-
-test "friendlyName strips named test that looks like test_N" {
-    // A test named "test_42" should be stripped to "test_42", not treated
-    // as an unnamed test. The builtin name is "module.test.test_42" which
-    // has a ".test." separator — unnamed tests have ".test_0" with no
-    // ".test." segment.
-    const name = "module.test.test_42";
-    try std.testing.expectEqualStrings("test_42", friendlyName(name));
-}
 
 test "basic arithmetic passes" {
     try std.testing.expect(1 + 1 == 2);
@@ -66,15 +25,13 @@ test "memory leak detection" {
 }
 
 test "emits error log but succeeds" {
-    // This test should be treated as a FAILURE by the runner, even though
-    // the test function itself returns success. Error logs count as failures.
+    // Error logs must fail this test despite its successful return.
     std.log.err("something went wrong", .{});
     try std.testing.expect(true);
 }
 
 test "fuzz: simple corpus" {
-    // Verify that std.testing.fuzz works with ztest — it should just run
-    // the corpus inputs as normal test calls (non-fuzz mode).
+    // Corpus execution does not require the server protocol.
     try std.testing.fuzz(.{}, fuzzCallback, .{
         .corpus = &.{
             "hello",
@@ -89,15 +46,41 @@ fn fuzzCallback(_: @TypeOf(.{}), smith: *std.testing.Smith) anyerror!void {
     _ = smith.slice(&buf);
 }
 
-// ── Internal helpers (copied from test_runner.zig for testing) ──────────────
+test "fuzz corpus matches the standard runner" {
+    var calls: u32 = 0;
+    try std.testing.fuzz(&calls, fuzzCorpusCallback, .{ .corpus = &.{"hello"} });
+    try std.testing.expectEqual(@as(u32, 2), calls);
+}
 
-fn friendlyName(name: []const u8) []const u8 {
-    var it = std.mem.splitScalar(u8, name, '.');
-    while (it.next()) |segment| {
-        if (std.mem.eql(u8, segment, "test")) {
-            const rest = it.rest();
-            return if (rest.len > 0) rest else name;
-        }
-    }
-    return name;
+fn fuzzCorpusCallback(calls: *u32, smith: *std.testing.Smith) anyerror!void {
+    const expected: []const u8 = if (calls.* == 0) "hello" else "";
+    try std.testing.expectEqualStrings(expected, smith.in.?);
+    calls.* += 1;
+}
+
+test "fuzz without a corpus runs an empty smoke test" {
+    var calls: u32 = 1;
+    try std.testing.fuzz(&calls, fuzzCorpusCallback, .{});
+    try std.testing.expectEqual(@as(u32, 2), calls);
+}
+
+test "testing.io and environ are initialized" {
+    const allocator = std.testing.allocator;
+    const path = try std.testing.environ.getAlloc(allocator, "PATH");
+    defer allocator.free(path);
+    try std.testing.expect(path.len > 0);
+    const start = std.Io.Clock.Timestamp.now(std.testing.io, .awake);
+    try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    try std.testing.expect(start.untilNow(std.testing.io).raw.nanoseconds > 0);
+}
+
+test "seed supplied by runner" {
+    const allocator = std.testing.allocator;
+    const expected = std.testing.environ.getAlloc(allocator, "ZTEST_EXPECT_SEED") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => return,
+        else => return err,
+    };
+    defer allocator.free(expected);
+    const seed = try std.fmt.parseUnsigned(u32, expected, 0);
+    try std.testing.expectEqual(seed, std.testing.random_seed);
 }

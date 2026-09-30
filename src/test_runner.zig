@@ -21,28 +21,30 @@
 //!   ZTEST_FILTER=substr Only run tests whose name contains substr
 
 const std = @import("std");
+const testing = std.testing;
+const debug = std.debug;
+const process = std.process;
+const Io = std.Io;
+const ascii = std.ascii;
+const print = debug.print;
 const builtin = @import("builtin");
 
 var current_test: ?[]const u8 = null;
 var log_err_count: usize = 0;
-var panicking: bool = false;
+threadlocal var panicking: bool = false;
 
-/// Requires Zig 0.16. The std.Io-era APIs (std.process.exit,
-/// std.testing.io_instance, dumpErrorReturnTrace) are used unconditionally.
-/// Root-level log function. std.log calls @import("root").logFn, which defaults
-/// to this. We count .err level messages so we can fail tests that emit error
-/// logs even if the test function itself returns success — matching the
-/// built-in runner's behavior.
+/// Error logs fail tests, as they do with the built-in runner.
 pub const std_options: std.Options = .{
     .logFn = log,
 };
 
 pub fn log(
     comptime message_level: std.log.Level,
-    comptime scope: @TypeOf(.enum_literal),
+    comptime scope: @EnumLiteral(),
     comptime format: []const u8,
     args: anytype,
 ) void {
+    @disableInstrumentation();
     if (@intFromEnum(message_level) <= @intFromEnum(std.log.Level.err)) {
         log_err_count +|= 1;
     }
@@ -51,38 +53,11 @@ pub fn log(
     }
 }
 
-/// Exit with a status code.
-fn hardExit(status: u8) noreturn {
-    std.process.exit(status);
-}
-
-/// Monotonic timer. 0.16 removed std.time.Timer, so we use
-/// libc clock_gettime(CLOCK_MONOTONIC) directly — the runner links libc.
-const Timer = struct {
-    start_ts: std.c.timespec,
-
-    fn start() Timer {
-        var ts: std.c.timespec = undefined;
-        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
-        return .{ .start_ts = ts };
-    }
-
-    /// Elapsed time in nanoseconds.
-    fn read(self: *const Timer) u64 {
-        var now_ts: std.c.timespec = undefined;
-        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &now_ts);
-        const sec: u64 = @intCast(now_ts.sec - self.start_ts.sec);
-        const nsec: u64 = @intCast(now_ts.nsec);
-        return sec * std.time.ns_per_s + nsec;
-    }
-};
-
-pub const panic = std.debug.FullPanic(struct {
+pub const panic = debug.FullPanic(struct {
     pub fn panicFn(msg: []const u8, first_trace_addr: ?usize) noreturn {
-        // Guard against recursive panic — if dumpBoundedStackTrace itself
-        // panics (e.g. corrupt debug info), don't re-enter.
+        // Exit if the stack trace code itself panics.
         if (panicking) {
-            hardExit(1);
+            process.exit(1);
         }
         panicking = true;
 
@@ -92,56 +67,49 @@ pub const panic = std.debug.FullPanic(struct {
             print("PANIC: {s}\n", .{msg});
         }
 
-        // Do NOT call std.debug.defaultPanic — it calls dumpCurrentStackTrace
-        // which uses StackIterator to walk live stack frames. On some platforms
-        // (aarch64-linux in VMs), StackIterator.next() never returns null,
-        // causing an infinite loop at 100% CPU.
-        // See https://github.com/ziglang/zig/issues/18286
-        //
-        // Instead, do a bounded stack walk that is guaranteed to terminate.
-        dumpBoundedStackTrace(first_trace_addr);
-        hardExit(1);
+        debug.dumpCurrentStackTrace(.{
+            .first_address = first_trace_addr orelse @returnAddress(),
+            .allow_unsafe_unwind = true,
+        });
+        process.exit(1);
     }
 }.panicFn);
 
 /// Print an error return trace to stderr.
 fn dumpTrace(trace: ?*std.builtin.StackTrace) void {
     if (trace) |tr| {
-        std.debug.dumpErrorReturnTrace(tr);
+        debug.dumpErrorReturnTrace(tr);
     }
 }
 
-/// Print the panic address. 0.16 made StackIterator/printSourceAtAddress
-/// private, so a bounded source-resolved walk is no longer available here.
-/// The error-return-trace path (dumpErrorReturnTrace) still gets full source
-/// resolution. Address-only output also sidesteps the StackIterator
-/// infinite-loop hazard on aarch64 VMs (ziglang/zig#18286).
-fn dumpBoundedStackTrace(start_addr: ?usize) void {
-    if (start_addr) |addr| {
-        print("  panic address: 0x{x}\n", .{addr});
+pub fn main(init: process.Init) u8 {
+    @disableInstrumentation();
+    if (builtin.fuzz) {
+        @compileError("ztest: fuzz mode needs the default test runner. Disable ztest for --fuzz.");
     }
-}
-
-pub fn main() !void {
-    var mem: [4096]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&mem);
-    const allocator = fba.allocator();
-
-    // No --seed parsing: 0.16 removed std.process.args(); args are only
-    // available via the main function parameter, which .mode = .simple
-    // doesn't use.
+    const io = init.io;
+    var args = init.minimal.args.iterateAllocator(init.gpa) catch |err|
+        process.fatal("ztest: cannot read arguments: {t}", .{err});
+    defer args.deinit();
+    _ = args.skip();
+    while (args.next()) |arg| {
+        if (std.mem.startsWith(u8, arg, "--seed=")) {
+            testing.random_seed = std.fmt.parseUnsigned(u32, arg["--seed=".len..], 0) catch
+                process.fatal("ztest: invalid seed: {s}", .{arg});
+        } else {
+            process.fatal("ztest: unrecognized argument: {s}", .{arg});
+        }
+    }
 
     if (builtin.test_functions.len == 0) {
         print("no tests found\n", .{});
-        return;
+        return 0;
     }
 
-    const env = Env.init(allocator);
-    defer env.deinit(allocator);
-
-    const have_tty = isStderrTty();
+    const env: Env = .init(init.environ_map);
+    const have_tty = Io.File.stderr().isTty(io) catch unreachable;
     const plain = env.plain or !have_tty;
-    const verbose = env.verbose orelse plain;
+    const verbose = env.plain or (env.verbose orelse plain);
 
     // Pre-count matching tests if a filter is active, so indices and totals
     // reflect only the tests that will actually run.
@@ -153,7 +121,7 @@ pub fn main() !void {
         break :blk count;
     } else builtin.test_functions.len;
 
-    const timer = Timer.start();
+    const start: Io.Clock.Timestamp = .now(io, .awake);
 
     print("ztest: Running {d} test{s}...\n", .{ total, if (total != 1) "s" else "" });
     if (!verbose) print("\n", .{});
@@ -180,37 +148,28 @@ pub fn main() !void {
 
         current_test = name;
         testing.allocator_instance = .{};
-        // Mirror the default runner: tests may use std.testing.io (process
-        // spawn, file I/O, timestamps), which derefs io_instance. Without
-        // this init the first such test segfaults in the allocator. The
-        // environ comes from the C environ block because a simple-mode main
-        // receives no Init.Minimal — an empty block means default PATH, and
-        // spawned children (openssl in interop tests) would not resolve.
-        const environ: std.process.Environ = if (builtin.link_libc) blk: {
-            const c_environ = std.c.environ;
-            var n: usize = 0;
-            while (c_environ[n] != null) : (n += 1) {}
-            break :blk .{ .block = .{ .slice = c_environ[0..n :null] } };
-        } else .empty;
-        testing.environ = environ;
-        testing.io_instance = .init(testing.allocator, .{ .environ = environ });
+        // Keep test I/O allocations separate from the runner's I/O allocations.
+        testing.environ = init.minimal.environ;
+        testing.io_instance = .init(testing.allocator, .{
+            .argv0 = .init(init.minimal.args),
+            .environ = init.minimal.environ,
+        });
         testing.log_level = .warn;
         log_err_count = 0;
 
-        var test_timer = Timer.start();
+        const test_start: Io.Clock.Timestamp = .now(io, .awake);
+        // Do not include errors from earlier tests in this test's trace.
+        if (@errorReturnTrace()) |trace| trace.index = 0;
         const result = t.func();
 
         current_test = null;
-        // Capture log_err_count and error return trace BEFORE deinit — deinit
-        // calls detectLeaks which logs leaks at .err level and can corrupt
-        // the error return trace. @errorReturnTrace() returns null if the
-        // last call didn't return an error.
+        // Capture test diagnostics before teardown emits allocator diagnostics.
         const test_log_errs = log_err_count;
         const trace = @errorReturnTrace();
         testing.io_instance.deinit();
         const leaked = testing.allocator_instance.deinit() == .leak;
 
-        const ns = test_timer.read();
+        const elapsed = test_start.untilNow(io).raw;
         const idx = run_idx;
 
         // Error logs count as a test failure, even if the test function returned
@@ -219,13 +178,17 @@ pub fn main() !void {
             fail += 1;
             log_errs += test_log_errs;
             if (verbose) {
-                printStatus(.fail, idx, total, name, ns, "ErrorLogEmitted", plain);
-                print("  {d} error log{s} emitted during test\n", .{ test_log_errs, if (test_log_errs != 1) "s" else "" });
+                printStatus(.fail, idx, total, name, elapsed, "ErrorLogEmitted", plain);
+                print("  {d} error log{s} emitted during test\n", .{
+                    test_log_errs, if (test_log_errs != 1) "s" else "",
+                });
             } else {
                 dot(.fail, plain);
                 print("\n", .{});
-                printStatus(.fail, idx, total, name, ns, "ErrorLogEmitted", plain);
-                print("  {d} error log{s} emitted during test\n", .{ test_log_errs, if (test_log_errs != 1) "s" else "" });
+                printStatus(.fail, idx, total, name, elapsed, "ErrorLogEmitted", plain);
+                print("  {d} error log{s} emitted during test\n", .{
+                    test_log_errs, if (test_log_errs != 1) "s" else "",
+                });
                 print("\n", .{});
             }
             if (env.fail_fast) should_stop = true;
@@ -233,7 +196,7 @@ pub fn main() !void {
             if (leaked) {
                 leak += 1;
                 if (verbose) {
-                    printStatus(.leak, idx, total, name, ns, null, plain);
+                    printStatus(.leak, idx, total, name, elapsed, null, plain);
                 } else {
                     dot(.leak, plain);
                 }
@@ -244,7 +207,7 @@ pub fn main() !void {
         if (result) |_| {
             pass += 1;
             if (verbose) {
-                printStatus(.pass, idx, total, name, ns, null, plain);
+                printStatus(.pass, idx, total, name, elapsed, null, plain);
             } else {
                 dot(.pass, plain);
             }
@@ -252,7 +215,7 @@ pub fn main() !void {
             error.SkipZigTest => {
                 skip += 1;
                 if (verbose) {
-                    printStatus(.skip, idx, total, name, ns, null, plain);
+                    printStatus(.skip, idx, total, name, elapsed, null, plain);
                 } else {
                     dot(.skip, plain);
                 }
@@ -260,12 +223,12 @@ pub fn main() !void {
             else => {
                 fail += 1;
                 if (verbose) {
-                    printStatus(.fail, idx, total, name, ns, @errorName(err), plain);
+                    printStatus(.fail, idx, total, name, elapsed, @errorName(err), plain);
                     dumpTrace(trace);
                 } else {
                     dot(.fail, plain);
                     print("\n", .{});
-                    printStatus(.fail, idx, total, name, ns, @errorName(err), plain);
+                    printStatus(.fail, idx, total, name, elapsed, @errorName(err), plain);
                     dumpTrace(trace);
                     print("\n", .{});
                 }
@@ -276,7 +239,7 @@ pub fn main() !void {
         if (leaked) {
             leak += 1;
             if (verbose) {
-                printStatus(.leak, idx, total, name, ns, null, plain);
+                printStatus(.leak, idx, total, name, elapsed, null, plain);
             } else {
                 dot(.leak, plain);
             }
@@ -286,14 +249,14 @@ pub fn main() !void {
 
     if (!verbose) print("\n", .{});
 
-    const elapsed_ns: u64 = timer.read();
-    const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
+    const elapsed = start.untilNow(io).raw;
 
     print("\nztest: {d} passed, {d} failed, {d} skipped", .{ pass, fail, skip });
     if (leak > 0) print(", {d} leaked", .{leak});
     if (log_errs > 0) print(", {d} error logs", .{log_errs});
-    print(" (of {d} total) in {d:.0}ms", .{ total, elapsed_ms });
-    print("\n", .{});
+    print(" (of {d} total) in {d}ms (seed: 0x{x})\n", .{
+        total, elapsed.toMilliseconds(), testing.random_seed,
+    });
 
     if (fail == 0 and leak == 0) {
         print("ALL TESTS PASSED\n", .{});
@@ -301,24 +264,12 @@ pub fn main() !void {
         print("TESTS FAILED\n", .{});
     }
 
-    if (fail != 0 or leak != 0 or log_errs != 0) {
-        hardExit(1);
-    }
+    return if (fail != 0 or leak != 0 or log_errs != 0) 1 else 0;
 }
 
-// ── Output ──────────────────────────────────────────────────────────────────
-
-/// Check whether stderr is a TTY. Uses libc isatty(2) — 0.16 has no non-Io
-/// std API for it, and the runner links libc.
-fn isStderrTty() bool {
-    return std.c.isatty(2) != 0;
-}
+// -- Output ------------------------------------------------------------------
 
 const Status = enum { pass, fail, skip, leak };
-
-fn print(comptime fmt: []const u8, args: anytype) void {
-    std.debug.print(fmt, args);
-}
 
 fn dot(status: Status, plain: bool) void {
     const ch: u8 = switch (status) {
@@ -345,7 +296,7 @@ fn printStatus(
     idx: usize,
     total: usize,
     name: []const u8,
-    ns: u64,
+    elapsed: Io.Duration,
     err_name: ?[]const u8,
     plain: bool,
 ) void {
@@ -356,7 +307,7 @@ fn printStatus(
         .leak => "LEAK",
     };
 
-    const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
+    const ms = @as(f64, @floatFromInt(elapsed.nanoseconds)) / std.time.ns_per_ms;
 
     if (plain) {
         if (err_name) |e| {
@@ -381,7 +332,7 @@ fn printStatus(
     }
 }
 
-// ── Test name formatting ────────────────────────────────────────────────────
+// -- Test name formatting ----------------------------------------------------
 
 /// Extract a human-friendly test name from the fully-qualified builtin name.
 /// Named tests:   "myapp.parser.test.parseJson" -> "parseJson"
@@ -405,7 +356,7 @@ fn friendlyName(name: []const u8) []const u8 {
     return name;
 }
 
-// ── Environment variables ───────────────────────────────────────────────────
+// -- Environment variables ---------------------------------------------------
 
 const Env = struct {
     verbose: ?bool,
@@ -413,101 +364,121 @@ const Env = struct {
     fail_fast: bool,
     filter: ?[]const u8,
 
-    fn init(allocator: std.mem.Allocator) Env {
+    fn init(environ: *const process.Environ.Map) Env {
         return .{
-            .verbose = readEnvBool(allocator, "ZTEST_VERBOSE"),
-            .plain = readEnvBoolDefault(allocator, "ZTEST_PLAIN", false),
-            .fail_fast = readEnvBoolDefault(allocator, "ZTEST_FAIL_FAST", false),
-            .filter = readEnv(allocator, "ZTEST_FILTER"),
+            .verbose = readEnvBool(environ, "ZTEST_VERBOSE"),
+            .plain = readEnvBool(environ, "ZTEST_PLAIN") orelse false,
+            .fail_fast = readEnvBool(environ, "ZTEST_FAIL_FAST") orelse false,
+            .filter = environ.get("ZTEST_FILTER"),
         };
-    }
-
-    fn deinit(self: Env, allocator: std.mem.Allocator) void {
-        if (self.filter) |f| allocator.free(f);
     }
 };
 
-fn readEnv(allocator: std.mem.Allocator, key: []const u8) ?[]const u8 {
-    // Use libc getenv — in 0.16 there is no non-Io std API for this, and
-    // the runner links libc. Returns a pointer to the env var value
-    // (NUL-terminated) or null if not set.
-    const key_z = allocator.dupeZ(u8, key) catch return null;
-    defer allocator.free(key_z);
-    const raw = std.c.getenv(key_z) orelse return null;
-    const value = std.mem.sliceTo(raw, 0);
-    return allocator.dupe(u8, value) catch null;
-}
-
-fn readEnvBool(allocator: std.mem.Allocator, key: []const u8) ?bool {
-    const value = readEnv(allocator, key) orelse return null;
-    defer allocator.free(value);
-    if (std.ascii.eqlIgnoreCase(value, "1") or std.ascii.eqlIgnoreCase(value, "true"))
+fn readEnvBool(environ: *const process.Environ.Map, key: []const u8) ?bool {
+    const value = environ.get(key) orelse return null;
+    if (ascii.eqlIgnoreCase(value, "1") or ascii.eqlIgnoreCase(value, "true"))
         return true;
-    if (std.ascii.eqlIgnoreCase(value, "0") or std.ascii.eqlIgnoreCase(value, "false"))
+    if (ascii.eqlIgnoreCase(value, "0") or ascii.eqlIgnoreCase(value, "false"))
         return false;
     return null;
 }
 
-fn readEnvBoolDefault(allocator: std.mem.Allocator, key: []const u8, default: bool) bool {
-    return readEnvBool(allocator, key) orelse default;
-}
-
-// ── Fuzz support ───────────────────────────────────────────────────────────
+// -- Fuzz support ------------------------------------------------------------
 //
-// std.testing.fuzz is an inline function that calls @import("root").fuzz(),
-// so the test runner (which is root in test mode) must export this function.
-//
-// When NOT in fuzz mode (normal `zig build test`), this just runs the provided
-// corpus inputs as regular test calls — no server protocol needed.
-//
-// When IN fuzz mode (`zig build test --fuzz`), this needs libfuzzer symbols
-// that are linked in a separate compilation unit. ztest does NOT support fuzz
-// mode — use the default test runner for fuzzing by conditionally setting
-// test_runner in build.zig only when not fuzzing.
+// std.testing.fuzz calls the root module's fuzz function.
+// The main function rejects fuzz mode because it needs the server protocol.
 
-/// Fuzzer extern symbols. These are only linked when builtin.fuzz is true.
-/// We declare them here so the function compiles, but they're only called
-/// in the `builtin.fuzz` branch which is never reached in simple mode.
-extern fn fuzzer_init_corpus_elem(input_ptr: [*]const u8, input_len: usize) void;
-extern fn fuzzer_start(testOne: *const fn ([*]const u8, usize) callconv(.c) void) void;
-
+// std.testing.fuzz requires this parameter order.
 pub fn fuzz(
     context: anytype,
-    comptime testOne: anytype,
+    comptime testOne: fn (@TypeOf(context), *testing.Smith) anyerror!void, // ziglint-ignore: Z023
     options: testing.FuzzInputOptions,
 ) anyerror!void {
     @disableInstrumentation();
 
-    // When not in fuzz mode, just run the corpus directly. The main test
-    // loop owns allocator teardown and leak detection — we don't touch the
-    // allocator here, matching the default runner's non-fuzz behavior.
-    if (!builtin.fuzz) {
-        // testOne takes *testing.Smith. Smith.slice expects a 4-byte
-        // little-endian length prefix followed by the data, so construct a
-        // compatible buffer for each corpus entry.
-        const max_smith_input = 65536;
-        for (options.corpus) |input| {
-            var buf: [max_smith_input + 4]u8 = undefined;
-            const data_len = @min(input.len, max_smith_input);
-            std.mem.writeInt(u32, buf[0..4], @intCast(data_len), .little);
-            @memcpy(buf[4..][0..data_len], input[0..data_len]);
-            var smith = testing.Smith{ .in = buf[0 .. 4 + data_len] };
-            try testOne(context, &smith);
-        }
-        if (options.corpus.len == 0) {
-            var smith = testing.Smith{ .in = &.{} };
-            try testOne(context, &smith);
-        }
-        return;
+    // Match the standard runner: preserve corpus bytes and add an empty smoke test.
+    for (options.corpus) |input| {
+        var smith: testing.Smith = .{ .in = input };
+        try testOne(context, &smith);
     }
-
-    // Fuzz mode requires the server protocol and libfuzzer. ztest uses
-    // .mode = .simple which bypasses the server protocol, so fuzzing
-    // is not supported here. Users should conditionally use the default
-    // runner when fuzzing — see the README for the build.zig pattern.
-    @panic("ztest: fuzz mode is not supported with .mode = .simple. Use the default test runner for --fuzz.");
+    var smith: testing.Smith = .{ .in = "" };
+    try testOne(context, &smith);
 }
 
-// ── Aliases ─────────────────────────────────────────────────────────────────
+// -- Self-tests --------------------------------------------------------------
 
-const testing = std.testing;
+test "friendlyName strips module path for named tests" {
+    const name = "myapp.parser.test.parseJson";
+    try testing.expectEqualStrings("parseJson", friendlyName(name));
+}
+
+test "friendlyName keeps unnamed tests as full name" {
+    const name = "myapp.parser.test_0";
+    try testing.expectEqualStrings("myapp.parser.test_0", friendlyName(name));
+}
+
+test "friendlyName handles deeply nested names" {
+    const name = "a.b.c.d.test.my_test";
+    try testing.expectEqualStrings("my_test", friendlyName(name));
+}
+
+test "friendlyName handles test at root" {
+    const name = "test.simple";
+    try testing.expectEqualStrings("simple", friendlyName(name));
+}
+
+test "friendlyName returns full name when no .test. segment" {
+    const name = "some.function";
+    try testing.expectEqualStrings("some.function", friendlyName(name));
+}
+
+test "friendlyName handles edge case: test_foo in nested module" {
+    // A test literally named "test_foo" in module "module" gets the
+    // builtin name "module.test.test_foo" — .test. separator is present.
+    const name = "module.test.test_foo";
+    try testing.expectEqualStrings("test_foo", friendlyName(name));
+}
+
+test "friendlyName strips named test that looks like test_N" {
+    // A named test retains the .test. separator even if its name resembles an unnamed test.
+    const name = "module.test.test_42";
+    try testing.expectEqualStrings("test_42", friendlyName(name));
+}
+
+test "environment defaults preserve automatic output selection" {
+    var environ: process.Environ.Map = .init(testing.allocator);
+    defer environ.deinit();
+    const env: Env = .init(&environ);
+    try testing.expectEqual(@as(?bool, null), env.verbose);
+    try testing.expect(!env.plain);
+    try testing.expect(!env.fail_fast);
+    try testing.expectEqual(@as(?[]const u8, null), env.filter);
+}
+
+test "environment booleans accept numeric and case-insensitive values" {
+    var environ: process.Environ.Map = .init(testing.allocator);
+    defer environ.deinit();
+    for ([_][]const u8{ "1", "true", "TRUE", "TrUe" }) |value| {
+        try environ.put("ZTEST_VERBOSE", value);
+        try testing.expectEqual(@as(?bool, true), readEnvBool(&environ, "ZTEST_VERBOSE"));
+    }
+    for ([_][]const u8{ "0", "false", "FALSE", "FaLsE" }) |value| {
+        try environ.put("ZTEST_VERBOSE", value);
+        try testing.expectEqual(@as(?bool, false), readEnvBool(&environ, "ZTEST_VERBOSE"));
+    }
+    try environ.put("ZTEST_VERBOSE", "invalid");
+    try testing.expectEqual(@as(?bool, null), readEnvBool(&environ, "ZTEST_VERBOSE"));
+}
+
+test "environment values do not need a fixed allocation buffer" {
+    var environ: process.Environ.Map = .init(testing.allocator);
+    defer environ.deinit();
+    const filter: [8192]u8 = @splat('x');
+    try environ.put("ZTEST_FILTER", &filter);
+    try environ.put("ZTEST_PLAIN", "1");
+    try environ.put("ZTEST_FAIL_FAST", "true");
+    const env: Env = .init(&environ);
+    try testing.expectEqualStrings(&filter, env.filter.?);
+    try testing.expect(env.plain);
+    try testing.expect(env.fail_fast);
+}

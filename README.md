@@ -2,35 +2,42 @@
 
 A custom test runner for [Zig](https://ziglang.org/) that writes plain text to stderr instead of a TUI.
 
+ztest requires Zig 0.16.
+
 ```
 ztest: Running 42 tests...
 
-[1/42] PASS: addition works
-[2/42] FAIL: intentional failure — error.TestUnexpectedResult
+[1/42] PASS: addition works (0.01ms)
+[2/42] FAIL: intentional failure — error.TestUnexpectedResult (0.02ms)
   /path/to/tests.zig:19:5: 0x... in expect (test)
     try std.testing.expect(1 == 2);
     ^
-[3/42] SKIP: skipped test
-[4/42] LEAK: memory leak
+[3/42] SKIP: skipped test (0.00ms)
+[4/42] PASS: memory leak (0.03ms)
+[4/42] LEAK: memory leak (0.03ms)
 
-ztest: 39 passed, 1 failed, 1 skipped, 1 leaked (of 42 total) in 127ms
+ztest: 40 passed, 1 failed, 1 skipped, 1 leaked (of 42 total) in 127ms (seed: 0x1234)
 TESTS FAILED
 ```
 
-[![Zig](https://img.shields.io/badge/Zig-0.15.2-f7a41d?logo=zig&logoColor=white)](https://ziglang.org/)
+[![Zig](https://img.shields.io/badge/Zig-0.16.0-f7a41d?logo=zig&logoColor=white)](https://ziglang.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 ## Why?
 
-Zig's built-in test runner uses `std.Progress` for a TUI that doesn't make sense when piped. Under `zig build test`, the build runner and test binary talk over stdin/stdout with a binary protocol, so there's no readable output and writing to stdout in tests [deadlocks](https://github.com/ziglang/zig/issues/15091).
+Zig's built-in test runner uses `std.Progress` for a TUI. Under `zig build test`, the build runner and test binary communicate through a binary protocol on stdin and stdout. Test output on stdout can [deadlock](https://github.com/ziglang/zig/issues/15091) that protocol.
 
-ztest uses `.mode = .simple` to skip the protocol. Results go straight to stderr as plain text: one line per test, stack traces inline on failure.
+ztest uses `.mode = .simple` to skip the protocol. Results go to stderr as plain text, with inline stack traces on failure.
 
 ## Usage
 
+Fetch the current 0.16-native runner from the main branch:
+
 ```sh
-zig fetch --save https://github.com/mattrobenolt/ztest/archive/refs/tags/v0.1.0.tar.gz
+zig fetch --save https://github.com/mattrobenolt/ztest/archive/refs/heads/main.tar.gz
 ```
+
+Set the custom runner in `build.zig`:
 
 ```zig
 const ztest = b.dependency("ztest", .{});
@@ -45,7 +52,8 @@ const tests = b.addTest(.{
 });
 
 const run_tests = b.addRunArtifact(tests);
-run_tests.has_side_effects = true; // always run tests, don't cache
+run_tests.has_side_effects = true; // Always run tests.
+run_tests.addArg(b.fmt("--seed=0x{x}", .{b.seed}));
 
 const test_step = b.step("test", "Run tests");
 test_step.dependOn(&run_tests.step);
@@ -61,9 +69,11 @@ zig test --test-runner src/test_runner.zig foo.zig
 
 ztest checks whether stderr is a TTY and picks a format:
 
-**TTY:** colored dots (`.` pass, `F` fail, `S` skip, `L` leak). Set `ZTEST_VERBOSE=1` for one line per test with timing.
+**TTY:** colored dots (`.` pass, `F` fail, `S` skip, `L` leak). `ZTEST_VERBOSE=1` selects one line per test with elapsed time.
 
-**Non-TTY:** one line per test, no ANSI codes. This is what agents and CI see. Each line has the status, test name, and error details. Stack traces print inline on failure. Timing is always shown.
+**Non-TTY:** one line per test, no ANSI codes. Each line includes the status, test name, and elapsed time. Failures include error details and inline stack traces.
+
+Elapsed time uses `std.Io.Clock.awake`, the monotonic clock.
 
 ## Environment variables
 
@@ -78,24 +88,26 @@ ztest checks whether stderr is a TTY and picks a format:
 
 Same as the built-in runner:
 
-- Memory leak detection via `std.testing.allocator` (per-test reset and check)
+- Memory leak detection via `std.testing.allocator` in Debug and ReleaseSafe (per-test reset and check)
 - `error.SkipZigTest` handling
-- Stack traces on failure (`@errorReturnTrace`)
+- Error-return traces when error tracing is enabled (`@errorReturnTrace`)
 - `std.log` error level counting (tests that emit `.err` logs fail, even if the test function returns success)
 - `--seed=N` argument for `std.testing.random_seed` (printed in the summary for reproducibility)
 - Exit code 0 = all passed, 1 = any failure or leak
 
 ## Panic handling
 
-`std.debug.dumpCurrentStackTrace` can [loop forever at 100% CPU](https://github.com/ziglang/zig/issues/18286) on aarch64-linux in VMs when a test panics. The fix landed in Zig master but not 0.15.x.
+ztest prints the panic message and current test name, then calls `std.debug.dumpCurrentStackTrace`. If stack tracing is enabled, the trace includes source locations. Zig 0.16 bounds the stack walk, which fixes the [old infinite-loop bug](https://github.com/ziglang/zig/issues/18286).
 
-ztest's panic handler walks the stack with a hard 64-frame limit instead of calling `std.debug.defaultPanic`. The panic message, test name, and a bounded stack trace still print to stderr. A recursive-panic guard prevents re-entry if the stack walk itself panics.
+A recursive-panic guard exits if the trace code itself panics. A panic exits with code 1.
 
 ## Fuzz testing
 
-`std.testing.fuzz()` works. In non-fuzz mode (normal `zig build test`), it runs the provided corpus inputs as regular test calls and the main test loop handles leak detection.
+In normal test builds, `std.testing.fuzz()` passes each corpus input unchanged to `std.testing.Smith`. It also runs an empty-input smoke test, as the built-in runner does. The main test loop checks for leaks.
 
-For actual fuzzing (`zig build test --fuzz`), the build system needs the server protocol, which `.mode = .simple` bypasses. Use a conditional runner in `build.zig`:
+Actual fuzz mode needs the server protocol, which `.mode = .simple` bypasses.
+
+Select the default runner for fuzz mode in the consumer's `build.zig`:
 
 ```zig
 const ztest = b.dependency("ztest", .{});
@@ -112,9 +124,22 @@ const tests = b.addTest(.{
 ```
 
 - `zig build test` uses ztest
-- `zig build test -Dfuzz` uses the default runner
+- `zig build test -Dfuzz --fuzz` uses the default runner for fuzz mode
 
-If you run `--fuzz` without the conditional, ztest panics with a message pointing you to the default runner.
+ztest rejects fuzz builds at compile time with a diagnostic about the default runner.
+
+## Development
+
+Run the checks from the repository root:
+
+```sh
+zig build test
+zig build example
+```
+
+`zig build test` runs unit tests against the actual runner helpers. Fixture checks cover the runner's output and exit codes.
+
+The standalone example includes intentional failures and a panic. The root build checks those results, so both commands exit with code 0.
 
 ## License
 
