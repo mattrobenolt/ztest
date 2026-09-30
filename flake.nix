@@ -1,6 +1,4 @@
 {
-  description = "Zig development environment";
-
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
@@ -35,16 +33,11 @@
         {
           devShells.default = pkgs.mkShell {
             packages = with pkgs; [
-              zig_0_15
-              zls_0_15
+              zig_0_16
+              zls_0_16
               ziglint
               zigdoc
             ];
-
-            shellHook = ''
-              unset NIX_CFLAGS_COMPILE
-              unset ZIG_GLOBAL_CACHE_DIR
-            '';
           };
         };
     };
