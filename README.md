@@ -1,5 +1,7 @@
 # ztest
 
+> **Moved.** ztest is now part of [baskingspot/testingx](https://github.com/baskingspot/testingx), which carries the runner and the benchmarks in one repo. This repository is archived and stays as history.
+
 A custom test runner for [Zig](https://ziglang.org/) that writes plain text to stderr instead of a TUI.
 
 ztest requires Zig 0.16.
